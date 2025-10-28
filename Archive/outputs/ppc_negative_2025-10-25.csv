@@ -1,0 +1,4 @@
+Campaign Type,Campaign,Campaign Daily Budget,Campaign Start Date,Campaign End Date,Campaign Targeting Type,Campaign Strategy,Ad Group,Max Bid,Keyword/ASIN,Match Type,SKU,State,Placement,Custom Label 1,Source,Notes
+Negative,S2C_RAINBOW-2COMP-LB_Negs_Neg_RAINBOW_2COMP_LB,50.0,2025-10-25,,Manual,Legacy,Neg_RAINBOW-2COMP-LB,0,cheap lunch box,broad,RAINBOW-2COMP-LB,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_RAINBOW-2COMP-LB_Negs_Neg_RAINBOW_2COMP_LB,50.0,2025-10-25,,Manual,Legacy,Neg_RAINBOW-2COMP-LB,0,free lunch box,broad,RAINBOW-2COMP-LB,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_RAINBOW-2COMP-LB_Negs_Neg_RAINBOW_2COMP_LB,50.0,2025-10-25,,Manual,Legacy,Neg_RAINBOW-2COMP-LB,0,replacement lid,broad,RAINBOW-2COMP-LB,enabled,,auto_neg,user,auto-neg list

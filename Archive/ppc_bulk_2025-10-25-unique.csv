@@ -1,0 +1,17 @@
+Campaign Type,Campaign,Campaign Daily Budget,Campaign Start Date,Campaign End Date,Campaign Targeting Type,Campaign Strategy,Ad Group,Max Bid,Keyword/ASIN,Match Type,SKU,State,Placement,Custom Label 1,Source,Notes
+Auto,S2C_THERMA-24-SS_Auto_Auto_THERMA-24-SS,20,2025-10-25,,Auto,Legacy,Auto_THERMA-24-SS,0.6,,,THERMA-24-SS,enabled,,,user,auto harvest
+Manual,S2C_THERMA-24-SS_Manual_KW_THERMA-24-SS_Exact,50,2025-10-25,,Manual,Legacy,KW_THERMA-24-SS_Exact,1.5,ThermaCore 24oz Insulated Bottle ,exact,THERMA-24-SS,enabled,,seed,user,seed from title
+Manual,S2C_THERMA-24-SS_Manual_KW_THERMA-24-SS_phrase,50,2025-10-25,,Manual,Legacy,KW_THERMA-24-SS_phrase,2.0,stainless steel water bottle,phrase,THERMA-24-SS,enabled,,cerebro,cerebro,seeded from Cerebro
+Manual,S2C_THERMA-24-SS_Manual_KW_THERMA-24-SS_phrase,50,2025-10-25,,Manual,Legacy,KW_THERMA-24-SS_phrase,1.8,insulated water bottle,phrase,THERMA-24-SS,enabled,,cerebro,cerebro,seeded from Cerebro
+ProductTargeting,S2C_THERMA-24-SS_PT_PT_THERMA-24-SS,30,2025-10-25,,Product,Legacy,PT_THERMA-24-SS,0.5,B000ZENITH30,,THERMA-24-SS,enabled,,pt_cerebro,cerebro,target competitor ASIN
+ProductTargeting,S2C_THERMA-24-SS_PT_PT_THERMA-24-SS,30,2025-10-25,,Product,Legacy,PT_THERMA-24-SS,0.5,B000KIDS18,,THERMA-24-SS,enabled,,pt_cerebro,cerebro,target competitor ASIN
+Auto,S2C_ZENITH-30-TR_Auto_Auto_ZENITH-30-TR,20,2025-10-25,,Auto,Legacy,Auto_ZENITH-30-TR,0.6,,,ZENITH-30-TR,enabled,,,user,auto harvest
+Manual,S2C_ZENITH-30-TR_Manual_KW_ZENITH-30-TR_Exact,50,2025-10-25,,Manual,Legacy,KW_ZENITH-30-TR_Exact,1.5,Zenith 30oz Tumbler ,exact,ZENITH-30-TR,enabled,,seed,user,seed from title
+Manual,S2C_ZENITH-30-TR_Manual_KW_ZENITH-30-TR_phrase,50,2025-10-25,,Manual,Legacy,KW_ZENITH-30-TR_phrase,1.5,best tumbler for travel,phrase,ZENITH-30-TR,enabled,,cerebro,cerebro,seeded from Cerebro
+ProductTargeting,S2C_ZENITH-30-TR_PT_PT_ZENITH-30-TR,30,2025-10-25,,Product,Legacy,PT_ZENITH-30-TR,0.5,B000THERMA123,,ZENITH-30-TR,enabled,,pt_cerebro,cerebro,target competitor ASIN
+ProductTargeting,S2C_ZENITH-30-TR_PT_PT_ZENITH-30-TR,30,2025-10-25,,Product,Legacy,PT_ZENITH-30-TR,0.5,B000KIDS18,,ZENITH-30-TR,enabled,,pt_cerebro,cerebro,target competitor ASIN
+Auto,S2C_KIDS-18-PP_Auto_Auto_KIDS-18-PP,20,2025-10-25,,Auto,Legacy,Auto_KIDS-18-PP,0.6,,,KIDS-18-PP,enabled,,,user,auto harvest
+Manual,S2C_KIDS-18-PP_Manual_KW_KIDS-18-PP_Exact,50,2025-10-25,,Manual,Legacy,KW_KIDS-18-PP_Exact,1.5,LittleZen Kids Bottle 18oz ,exact,KIDS-18-PP,enabled,,seed,user,seed from title
+Manual,S2C_KIDS-18-PP_Manual_KW_KIDS-18-PP_phrase,50,2025-10-25,,Manual,Legacy,KW_KIDS-18-PP_phrase,1.2,kids water bottle leak proof,phrase,KIDS-18-PP,enabled,,cerebro,cerebro,seeded from Cerebro
+ProductTargeting,S2C_KIDS-18-PP_PT_PT_KIDS-18-PP,30,2025-10-25,,Product,Legacy,PT_KIDS-18-PP,0.5,B000THERMA123,,KIDS-18-PP,enabled,,pt_cerebro,cerebro,target competitor ASIN
+ProductTargeting,S2C_KIDS-18-PP_PT_PT_KIDS-18-PP,30,2025-10-25,,Product,Legacy,PT_KIDS-18-PP,0.5,B000ZENITH30,,KIDS-18-PP,enabled,,pt_cerebro,cerebro,target competitor ASIN

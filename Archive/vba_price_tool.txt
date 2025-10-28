@@ -1,0 +1,2279 @@
+/** Pricing Tool - Shell
+ * 1) Adds custom menu
+ * 2) Creates control cells if missing
+ * 3) Provides 'Fill Sample' helper
+ * 4) runPricingAnalysis() is a safe placeholder that writes Results headers
+ *
+ * Next steps: replace the placeholder computation with your computeCCS_v2 function.
+ */
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  const userEmail = Session.getActiveUser().getEmail();
+  const adminEmails = ['zenarisetrading@gmail.com']; // 🔒 add admin emails here
+
+  // ----- MAIN MENU (visible to everyone)
+  const mainMenu = ui.createMenu('💧 Pricing Engine');
+  mainMenu.addItem('▶️ Run Full Workflow', 'runFullPriceWorkflow');
+  mainMenu.addSeparator();
+  mainMenu.addItem('🧾 Show Logs', 'showLogs');
+  mainMenu.addItem('⚙️ Unhide All Sheets', 'unhideAllSheets');
+  mainMenu.addToUi();
+
+  // ----- ADMIN MENU (hidden unless admin email matches)
+  if (adminEmails.includes(userEmail)) {
+    const adminMenu = ui.createMenu('🔧 Admin Tools');
+    adminMenu.addItem('Transform Data Dump', 'transformDataDump');
+    adminMenu.addItem('Run Data Quality Check', 'runDataQualityCheck');
+    adminMenu.addItem('Run Outlier Trim (IQR)', 'runOutlierTrim');
+    adminMenu.addItem('Run Cluster Segmentation', 'runClusterSegmentation');
+    adminMenu.addItem('Run Brand Aggregation', 'runBrandAggregation');
+    adminMenu.addItem('Compute CCS', 'computeCCS_v2');
+    adminMenu.addItem('Validate Existing Prices', 'validateS2CPrices');
+    adminMenu.addItem('Recommend New Product Price', 'recommendNewProductPrice');
+    adminMenu.addSeparator();
+  adminMenu.addItem('📊 Generate Dashboard', 'generatePriceCCSVisuals_v2'); 
+  adminMenu.addItem('⚡ Fast Run', 'runFastWorkflow');
+    adminMenu.addToUi();
+  }
+}
+
+function ensureSheets() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const required = ['Raw_Data', 'Trimmed_Data', 'Results', 'Control', 'Logs'];
+  required.forEach(name => {
+    if (!ss.getSheetByName(name)) ss.insertSheet(name);
+  });
+  return ss;
+}
+
+function fillControlDefaults() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ctrl = ss.getSheetByName('Control');
+  ctrl.clear();
+  ctrl.getRange('A1').setValue('Parameter');
+  ctrl.getRange('B1').setValue('Value');
+  const rows = [
+    ['trim_pct', 10],
+    ['w_p', 0.35],
+    ['w_l', 0.30],
+    ['w_v', 0.20],
+    ['w_r', 0.15],
+    ['n_threshold', 20],
+    ['min_DQS', 0.1]
+  ];
+  ctrl.getRange(2,1,rows.length,2).setValues(rows);
+  ctrl.autoResizeColumns(1,2);
+}
+
+function fillSampleData() {
+  const ss = ensureSheets();
+  const raw = ss.getSheetByName('Raw_Data');
+  raw.clear();
+  raw.getRange(1,1,1,10).setValues([['sku','brand','category','price','listings','rating','review_count','velocity','source','scraped_at']]);
+
+  const sample = [
+    ['SKU001','BrandA','Bottles',14.99,12,4.6,120,0.8,'scrapeA','2025-10-22'],
+    ['SKU002','BrandA','Bottles',15.49,8,4.5,80,0.6,'scrapeA','2025-10-22'],
+    ['SKU003','BrandB','Bottles',12.50,25,4.2,200,1.2,'scrapeB','2025-10-22'],
+    ['SKU004','BrandC','Bottles',22.00,3,4.9,12,0.05,'scrapeC','2025-10-22'],
+    ['SKU005','BrandD','Bottles',9.99,40,4.0,400,2.1,'scrapeD','2025-10-22']
+  ];
+  raw.getRange(2,1,sample.length,sample[0].length).setValues(sample);
+  fillControlDefaults();
+  SpreadsheetApp.getUi().alert('Sample data populated in Raw_Data and Control tabs.');
+}
+
+/** Minimal safe runner — shell for the main flow */
+function runPricingAnalysis() {
+  const ss = ensureSheets();
+  const raw = ss.getSheetByName('Raw_Data');
+  const results = ss.getSheetByName('Results');
+  const logs = ss.getSheetByName('Logs');
+
+  // Basic sanity checks
+  const rawRange = raw.getDataRange();
+  const rawValues = rawRange.getValues();
+  if (rawValues.length <= 1) {
+    SpreadsheetApp.getUi().alert('Raw_Data is empty. Use Fill Sample or paste your CSV into Raw_Data.');
+    return;
+  }
+
+  // Write Results headers (the shell)
+  results.clear();
+  const headers = ['category','brand','median_price','total_listings','n','std_price','DQS','rawScore','CCS_v2','tier','suggested_low','suggested_high'];
+  results.getRange(1,1,1,headers.length).setValues([headers]);
+
+  // Log the run
+  const now = new Date();
+  logs.appendRow([now, 'runPricingAnalysis', rawValues.length-1 + ' rows', 'OK']);
+  SpreadsheetApp.getUi().alert('Shell run complete — Results headers created. Next: paste computeCCS_v2 into the script to perform calculations.');
+}
+
+/* Helper utilities you will use later (median/std) */
+function calcMedian(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const s = arr.slice().sort((a,b)=>a-b);
+  const mid = Math.floor(s.length/2);
+  return s.length % 2 === 0 ? (s[mid-1] + s[mid]) / 2 : s[mid];
+}
+function stddev(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const mean = arr.reduce((a,b)=>a+b,0)/arr.length;
+  const variance = arr.reduce((s,x)=>s + Math.pow(x-mean,2),0) / arr.length;
+  return Math.sqrt(variance);
+}
+
+/**
+ * Transform full data_dump → Raw_Data (extract only key columns)
+ * Enhanced: strips currency text (e.g., "AED 17.99"), removes thousands separators, parses numeric price
+ */
+function transformDataDump() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Ensure sheets exist
+  let dump = ss.getSheetByName('data_dump');
+  if (!dump) dump = ss.insertSheet('data_dump');
+  let raw = ss.getSheetByName('Raw_Data');
+  if (!raw) raw = ss.insertSheet('Raw_Data');
+
+  const dumpValues = dump.getDataRange().getValues();
+  if (dumpValues.length <= 1) {
+    SpreadsheetApp.getUi().alert('⚠️ data_dump sheet is empty. Please paste your full export first.');
+    return;
+  }
+
+  // Map headers (case-insensitive trim)
+  const headers = dumpValues[0].map(h => h.toString().trim().toLowerCase());
+  const getIndex = (label) => headers.indexOf(label.toLowerCase());
+
+  const idxProductName   = getIndex('product name');
+  const idxBrand         = getIndex('brand');
+  const idxPrice         = getIndex('price');
+  const idxReviews       = getIndex('reviews');
+  const idxRating        = getIndex('ratings');
+  const idxBSR           = getIndex('bsr');
+  const idxListingHealth = getIndex('listing health');
+  const idxSponsored     = getIndex('is sponsored');
+  const idxPosition      = getIndex('position');
+
+  const requiredIdx = [idxProductName, idxBrand, idxPrice, idxReviews, idxRating, idxBSR, idxListingHealth, idxSponsored, idxPosition];
+  const missing = requiredIdx.some(i => i === -1);
+
+  if (missing) {
+    SpreadsheetApp.getUi().alert('⚠️ One or more required headers are missing in data_dump. Please check column names.');
+    return;
+  }
+
+  // Helper to parse price strings like "AED 17.99" or "17.990,00" etc.
+  function parsePriceRaw(val) {
+    if (val === null || val === undefined) return 0;
+    const s = val.toString().trim();
+    if (s === '') return 0;
+    // remove currency letters and words (keep digits, dots, commas, minus)
+    // also handle thousands separators by removing commas if dot is decimal, otherwise replace comma with dot
+    // Simplest reliable approach: extract the first substring that looks like a number with optional thousands separators
+    // Normalize: remove non-digit/.,- then handle multiple dots/commas conservatively
+    // Strategy: remove letters, keep digits , . -
+    let cleaned = s.replace(/[^\d\.,-]/g, '');
+    // If cleaned contains both comma and dot, assume comma is thousands sep (e.g. 1,234.56) => remove commas
+    if (cleaned.indexOf(',') !== -1 && cleaned.indexOf('.') !== -1) {
+      cleaned = cleaned.replace(/,/g, '');
+    } else if (cleaned.indexOf(',') !== -1 && cleaned.indexOf('.') === -1) {
+      // only comma present — treat comma as decimal separator (e.g. "17,99") -> replace with dot
+      cleaned = cleaned.replace(/,/g, '.');
+    }
+    // remove any remaining stray characters
+    cleaned = cleaned.replace(/[^0-9.\-]/g, '');
+    const num = parseFloat(cleaned);
+    return isNaN(num) ? 0 : num;
+  }
+
+  // Build transformed rows, skipping completely blank rows
+  const body = [];
+  for (let i = 1; i < dumpValues.length; i++) {
+    const r = dumpValues[i];
+    // detect all-empty row
+    const anyNonEmpty = r.some(cell => cell !== '' && cell !== null && cell !== undefined && cell.toString().trim() !== '');
+    if (!anyNonEmpty) continue;
+
+    const productRaw = r[idxProductName];
+    const product = productRaw === null || productRaw === undefined ? '' : productRaw.toString().trim();
+    const brandRaw = r[idxBrand];
+    const brand = brandRaw === null || brandRaw === undefined ? '' : brandRaw.toString().trim();
+
+    const priceRaw = r[idxPrice];
+    const priceNum = parsePriceRaw(priceRaw);
+
+    const reviewsRaw = r[idxReviews];
+    const reviews = (reviewsRaw === null || reviewsRaw === undefined || reviewsRaw.toString().trim() === '') ? 0 : parseFloat(reviewsRaw) || 0;
+
+    const ratingRaw = r[idxRating];
+    const rating = (ratingRaw === null || ratingRaw === undefined || ratingRaw.toString().trim() === '') ? 0 : parseFloat(ratingRaw) || 0;
+
+    const bsrRaw = r[idxBSR]; const bsr = bsrRaw === null || bsrRaw === undefined ? '' : bsrRaw.toString().trim();
+    const healthRaw = r[idxListingHealth]; const health = healthRaw === null || healthRaw === undefined ? '' : healthRaw.toString().trim();
+    const sponsoredRaw = r[idxSponsored]; const sponsored = sponsoredRaw === null || sponsoredRaw === undefined ? '' : sponsoredRaw.toString().trim();
+    const positionRaw = r[idxPosition]; const position = positionRaw === null || positionRaw === undefined || positionRaw.toString().trim()==='' ? '' : parseInt(positionRaw) || '';
+
+    body.push([product, brand, priceNum, reviews, rating, bsr, health, sponsored, position]);
+  }
+
+  // Write to Raw_Data
+  raw.clear();
+  const newHeaders = ['Product Name','Brand','Price','Reviews','Rating','BSR','Listing Health','Is Sponsored','Position'];
+  raw.getRange(1, 1, 1, newHeaders.length).setValues([newHeaders]);
+  if (body.length) raw.getRange(2, 1, body.length, newHeaders.length).setValues(body);
+  raw.autoResizeColumns(1, newHeaders.length);
+
+  SpreadsheetApp.getUi().alert(`✅ Transformation complete: ${body.length} rows written to Raw_Data.`);
+}
+
+/**
+ * MODULE 2 (Updated) - Data Quality & Cleaning (non-destructive)
+ * Works with numeric Price produced by transformDataDump()
+ */
+function runDataQualityCheck() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const raw = ss.getSheetByName('Raw_Data');
+  const trimmed = ss.getSheetByName('Trimmed_Data') || ss.insertSheet('Trimmed_Data');
+  const logs = ss.getSheetByName('Logs');
+
+  const data = raw.getDataRange().getValues();
+  if (data.length <= 1) {
+    SpreadsheetApp.getUi().alert("⚠️ Raw_Data is empty. Please transform data_dump first.");
+    return;
+  }
+
+  const headers = data[0];
+  const rows = data.slice(1);
+
+  const idxProduct = headers.indexOf('Product Name');
+  const idxBrand = headers.indexOf('Brand');
+  const idxPrice = headers.indexOf('Price');
+  const idxReviews = headers.indexOf('Reviews');
+  const idxRating = headers.indexOf('Rating');
+  const idxBSR = headers.indexOf('BSR');
+  const idxHealth = headers.indexOf('Listing Health');
+  const idxSponsored = headers.indexOf('Is Sponsored');
+  const idxPosition = headers.indexOf('Position');
+
+  const cleaned = [];
+  const flagged = [];
+
+  rows.forEach((r, rowIndex) => {
+    const product = (r[idxProduct] || '').toString().trim();
+    const brand = (r[idxBrand] || '').toString().trim();
+    let price = parseFloat(r[idxPrice]);
+    if (isNaN(price)) price = 0;
+    let reviews = parseFloat(r[idxReviews]);
+    if (isNaN(reviews)) reviews = 0;
+    let rating = parseFloat(r[idxRating]);
+    if (isNaN(rating)) rating = 0;
+    const bsr = (r[idxBSR] || '').toString().trim();
+    const health = (r[idxHealth] || '').toString().trim();
+    const sponsored = (r[idxSponsored] || '').toString().trim();
+    const position = r[idxPosition] === '' ? '' : (parseInt(r[idxPosition]) || '');
+
+    // Non-destructive flagging
+    let issue = '';
+    if (!brand) issue += 'Missing brand; ';
+    if (!product) issue += 'Missing product; ';
+    if (price <= 0) issue += 'Missing price; ';
+    if (reviews === 0) issue += 'No reviews; ';
+    if (rating === 0) issue += 'No rating; ';
+
+    const flag = (issue === '') ? 'OK' : issue.trim();
+    cleaned.push([product, brand, price, reviews, rating, bsr, health, sponsored, position, flag]);
+
+    if (flag !== 'OK') {
+      flagged.push({row: rowIndex + 2, product: product || '(blank)', issue: flag});
+    }
+  });
+
+  // Write results
+  trimmed.clear();
+  const newHeaders = ['Product Name','Brand','Price','Reviews','Rating','BSR','Listing Health','Is Sponsored','Position','Issue Flag'];
+  trimmed.getRange(1, 1, 1, newHeaders.length).setValues([newHeaders]);
+  if (cleaned.length) trimmed.getRange(2, 1, cleaned.length, newHeaders.length).setValues(cleaned);
+  trimmed.autoResizeColumns(1, newHeaders.length);
+
+  // Log summary
+  const now = new Date();
+  const summary = `Total: ${rows.length}, Flagged: ${flagged.length}`;
+  logs.appendRow([now, 'runDataQualityCheck', summary, JSON.stringify(flagged.slice(0,10))]);
+
+  SpreadsheetApp.getUi().alert(`✅ Data Quality Check Complete\nTotal Rows: ${rows.length}\nFlagged Rows: ${flagged.length}\n(First 10 flagged rows written to Logs)`);
+}
+/**
+ * MODULE 3: Adaptive Outlier Trimming (IQR-based) with Filtering
+ * 1) Reads user include/exclude/category/brand filters from Pricing_Input
+ * 2) Applies normalized filtering to Trimmed_Data -> writes Trimmed_Filtered
+ * 3) Runs IQR trimming on Trimmed_Filtered -> writes Outlier_Trimmed
+ * 4) Logs summary to Logs
+ */
+function runOutlierTrim() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const trimmed = ss.getSheetByName('Trimmed_Data');
+  const outSheet = ss.getSheetByName('Outlier_Trimmed') || ss.insertSheet('Outlier_Trimmed');
+  const filteredSheetName = 'Trimmed_Filtered';
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+
+  if (!trimmed) {
+    SpreadsheetApp.getUi().alert('⚠️ Trimmed_Data sheet missing. Run Data Quality Check first.');
+    return;
+  }
+
+  // --- 0) Read filter params from Pricing_Input
+  const pi = ss.getSheetByName('Pricing_Input');
+  let includeTerms = [], excludeTerms = [], categoryFilter = [], ownBrand = '';
+  if (pi) {
+    const pv = pi.getDataRange().getValues();
+    for (let i = 0; i < pv.length; i++) {
+      const key = (pv[i][0] || '').toString().trim().toLowerCase();
+      const val = (pv[i][1] || '').toString().trim();
+      if (!key) continue;
+      if (key === 'include_terms') includeTerms = val.split(',').map(s => normalize(s)).filter(Boolean);
+      if (key === 'exclude_terms') excludeTerms = val.split(',').map(s => normalize(s)).filter(Boolean);
+      if (key === 'category_filter') categoryFilter = val.split(',').map(s => normalize(s)).filter(Boolean);
+      if (key === 'brand_name') ownBrand = normalize(val);
+    }
+  }
+
+  // read min rows from Control if present
+  let minTrimRows = 10;
+  const control = ss.getSheetByName('Control');
+  if (control) {
+    const cv = control.getDataRange().getValues();
+    cv.forEach(r => {
+      const k = (r[0] || '').toString().trim().toLowerCase();
+      const v = r[1];
+      if (k === 'min_trim_rows') {
+        const n = Number(v);
+        if (!isNaN(n) && n > 0) minTrimRows = n;
+      }
+    });
+  }
+
+  // --- 1) Load trimmed data
+  const data = trimmed.getDataRange().getValues();
+  if (data.length <= 1) {
+    SpreadsheetApp.getUi().alert('⚠️ Trimmed_Data is empty. Please run Data Quality Check first.');
+    return;
+  }
+  const headers = data[0].map(h => h.toString().trim());
+  const rows = data.slice(1);
+
+  // header indices
+  const idxProd = headers.indexOf('Product Name') !== -1 ? headers.indexOf('Product Name') :
+                  (headers.indexOf('Product') !== -1 ? headers.indexOf('Product') : -1);
+  const idxBrand = headers.indexOf('Brand');
+  const idxPrice = headers.indexOf('Price');
+
+  if (idxPrice === -1) {
+    SpreadsheetApp.getUi().alert('⚠️ Trimmed_Data must contain a Price column.');
+    return;
+  }
+
+  // --- 2) Filter rows according to Pricing_Input (normalize & own-brand exclusion)
+  const filteredRows = rows.filter(r => {
+    const title = idxProd !== -1 ? normalize(r[idxProd]) : '';
+    const brand = idxBrand !== -1 ? normalize(r[idxBrand]) : '';
+    const price = Number(r[idxPrice]) || 0;
+    if (price <= 0) return false;
+
+    // exclude own-brand variants
+    if (ownBrand) {
+      if (brand === ownBrand || brand.indexOf(ownBrand) !== -1 || ownBrand.indexOf(brand) !== -1) return false;
+    }
+
+    // include terms (if provided) — at least one match
+    if (includeTerms.length) {
+      const ok = includeTerms.some(t => title.indexOf(t) !== -1);
+      if (!ok) return false;
+    }
+
+    // exclude terms (if provided) — none should match
+    if (excludeTerms.length) {
+      const bad = excludeTerms.some(t => title.indexOf(t) !== -1);
+      if (bad) return false;
+    }
+
+    // category filter (if provided) — at least one match on title
+    if (categoryFilter.length) {
+      const okcat = categoryFilter.some(t => title.indexOf(t) !== -1);
+      if (!okcat) return false;
+    }
+
+    return true;
+  });
+
+  // write filtered subset to Trimmed_Filtered
+  let tf = ss.getSheetByName(filteredSheetName);
+  if (!tf) tf = ss.insertSheet(filteredSheetName);
+  tf.clear();
+  tf.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (filteredRows.length) tf.getRange(2, 1, filteredRows.length, headers.length).setValues(filteredRows);
+  tf.autoResizeColumns(1, headers.length);
+
+  // --- 3) Run IQR trimming on the filteredRows (use filteredRows as input)
+  // collect valid numeric prices
+  const validRows = filteredRows.filter(r => !isNaN(parseFloat(r[idxPrice])) && parseFloat(r[idxPrice]) > 0);
+  const prices = validRows.map(r => parseFloat(r[idxPrice]));
+
+  if (prices.length < minTrimRows) {
+    const msg = `⚠️ Not enough valid rows for IQR trimming (need ≥ ${minTrimRows}). Filtered rows: ${prices.length}. Trim skipped.`;
+    logs.appendRow([new Date(), 'runOutlierTrim', msg, 'SKIPPED']);
+    SpreadsheetApp.getUi().alert(msg);
+    // still write Outlier_Trimmed as copy of Trimmed_Filtered (so downstream has something)
+    outSheet.clear();
+    outSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    if (filteredRows.length) outSheet.getRange(2, 1, filteredRows.length, headers.length).setValues(filteredRows);
+    outSheet.autoResizeColumns(1, headers.length);
+    return;
+  }
+
+  prices.sort((a, b) => a - b);
+  const q1 = percentile(prices, 25);
+  const q3 = percentile(prices, 75);
+  const iqr = q3 - q1;
+  const lowerBound = q1 - 1.5 * iqr;
+  const upperBound = q3 + 1.5 * iqr;
+
+  // keep rows within bounds
+  const kept = validRows.filter(r => {
+    const p = parseFloat(r[idxPrice]);
+    return p >= lowerBound && p <= upperBound;
+  });
+  const removed = validRows.length - kept.length;
+
+  // write kept rows to Outlier_Trimmed
+  outSheet.clear();
+  outSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (kept.length) outSheet.getRange(2, 1, kept.length, headers.length).setValues(kept);
+  outSheet.autoResizeColumns(1, headers.length);
+
+  // log summary
+  const now = new Date();
+  const summary = `Filtering -> Trimmed_Filtered: ${filteredRows.length} rows; IQR Trimming — Kept: ${kept.length}, Removed: ${removed}, Q1:${q1.toFixed(2)}, Q3:${q3.toFixed(2)}, IQR:${iqr.toFixed(2)}, Range:${lowerBound.toFixed(2)}–${upperBound.toFixed(2)}`;
+  logs.appendRow([now, 'runOutlierTrim', summary, 'OK']);
+
+  SpreadsheetApp.getUi().alert(`✅ Filtering + IQR Trimming Complete\nFiltered rows: ${filteredRows.length}\nKept: ${kept.length}\nRemoved: ${removed}\nPrice Range: ${lowerBound.toFixed(2)} - ${upperBound.toFixed(2)}`);
+}
+
+/** helper — percentile calculation */
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  const pos = (p / 100) * (arr.length - 1);
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return (arr[base + 1] !== undefined)
+    ? arr[base] + rest * (arr[base + 1] - arr[base])
+    : arr[base];
+}
+
+/** helper — normalize a string for matching/deduping */
+function normalize(s) {
+  if (!s && s !== 0) return '';
+  return s.toString().trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** update custom menu */
+
+/**
+ * runClusterSegmentation()
+ * Safe placeholder: copies base dataset (Outlier_Trimmed / Trimmed_Filtered / ...) into Cluster_Trimmed
+ * so downstream modules always operate on the filtered trimmed set.
+ */
+function runClusterSegmentation() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+  const base = getBaseDataSheet();
+  if (!base) {
+    SpreadsheetApp.getUi().alert('⚠️ No valid base dataset found for clustering. Run filtering + trimming first.');
+    logs.appendRow([new Date(), 'runClusterSegmentation', 'SKIPPED - no base data', '']);
+    return;
+  }
+
+  const vals = base.getDataRange().getValues();
+  if (!vals || vals.length <= 1) {
+    SpreadsheetApp.getUi().alert('⚠️ Base dataset has no rows for clustering.');
+    logs.appendRow([new Date(), 'runClusterSegmentation', 'SKIPPED - empty base', '']);
+    return;
+  }
+
+  // Write to Cluster_Trimmed (overwrite)
+  let clusterSheet = ss.getSheetByName('Cluster_Trimmed');
+  if (!clusterSheet) clusterSheet = ss.insertSheet('Cluster_Trimmed');
+  clusterSheet.clear();
+  clusterSheet.getRange(1,1,vals.length, vals[0].length).setValues(vals);
+  clusterSheet.autoResizeColumns(1, vals[0].length);
+
+  logs.appendRow([new Date(), 'runClusterSegmentation', `Copied ${vals.length-1} rows from ${base.getName()} to Cluster_Trimmed`, 'OK']);
+  SpreadsheetApp.getUi().alert(`Cluster_Trimmed updated — ${vals.length-1} rows copied from ${base.getName()}.`);
+}
+
+
+/* ---------- K-MEANS 1D implementation ---------- */
+/**
+ * Simple 1D k-means for array of numbers
+ * returns {centroids:[], assignments:[]}
+ * options: { maxIter, tol }
+ */
+function kMeans1D(values, k, options) {
+  options = options || {};
+  const maxIter = options.maxIter || 50;
+  const tol = options.tol || 1e-4;
+
+  const n = values.length;
+  // initialize centroids using quantiles for stability
+  const sorted = values.slice().sort((a,b)=>a-b);
+  const centroids = [];
+  for (let i = 0; i < k; i++) {
+    const q = (i + 0.5) / k * 100;
+    centroids.push(percentile(sorted, q));
+  }
+
+  let assignments = new Array(n).fill(-1);
+  for (let iter = 0; iter < maxIter; iter++) {
+    // assign step
+    let changed = false;
+    for (let i = 0; i < n; i++) {
+      let best = -1;
+      let bestDist = Infinity;
+      for (let c = 0; c < k; c++) {
+        const d = Math.abs(values[i] - centroids[c]);
+        if (d < bestDist) { bestDist = d; best = c; }
+      }
+      if (assignments[i] !== best) { assignments[i] = best; changed = true; }
+    }
+
+    // update step
+    const sums = new Array(k).fill(0);
+    const counts = new Array(k).fill(0);
+    for (let i = 0; i < n; i++) {
+      const c = assignments[i];
+      sums[c] += values[i];
+      counts[c] += 1;
+    }
+    let maxShift = 0;
+    for (let c = 0; c < k; c++) {
+      if (counts[c] > 0) {
+        const newCent = sums[c] / counts[c];
+        maxShift = Math.max(maxShift, Math.abs(newCent - centroids[c]));
+        centroids[c] = newCent;
+      } else {
+        // empty cluster -> reinitialize to a random point
+        centroids[c] = values[Math.floor(Math.random() * n)];
+        maxShift = Math.max(maxShift, 1e9);
+      }
+    }
+
+    if (!changed || maxShift <= tol) break;
+  }
+
+  return { centroids: centroids, assignments: assignments };
+}
+
+/* percentile helper reused from earlier */
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  const pos = (p / 100) * (arr.length - 1);
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return (arr[base + 1] !== undefined)
+    ? arr[base] + rest * (arr[base + 1] - arr[base])
+    : arr[base];
+}
+
+/* Update global menu to include cluster action */
+
+/**
+ * Module: Map cluster centroids to price bands and auto-trim extremes within each cluster
+ * - Source: Clustered_Data (generated by runClusterSegmentation)
+ * - Outputs:
+ *    1) Cluster_Bands (summary per cluster: centroid, count, min, max, q1, q3, iqr, bandLow, bandHigh)
+ *    2) Cluster_Trimmed (rows from Clustered_Data that fall within their cluster band)
+ * - Logs summary in Logs sheet
+ *
+ * Behavior notes:
+ * - Uses IQR-based band per cluster: [Q1 - 1.5*IQR, Q3 + 1.5*IQR]
+ * - Optionally, you can enable percentile clamping (5th/95th) by toggling USE_PERCENTILE_CLAMP
+ */
+
+function mapClusterBoundsAndTrim() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const src = ss.getSheetByName('Clustered_Data');
+  if (!src) {
+    SpreadsheetApp.getUi().alert('⚠️ Clustered_Data sheet not found. Run cluster segmentation first.');
+    return;
+  }
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+
+  const data = src.getDataRange().getValues();
+  if (data.length <= 1) {
+    SpreadsheetApp.getUi().alert('⚠️ Clustered_Data is empty.');
+    return;
+  }
+
+  const headers = data[0].map(h => h.toString().trim());
+  const rows = data.slice(1);
+
+  // locate columns
+  const idxPrice = headers.indexOf('Price');
+  const idxClusterID = headers.indexOf('ClusterID'); // centroid index
+  const idxTierLabel = headers.indexOf('Tier_Label');
+
+  if (idxPrice === -1 || idxClusterID === -1) {
+    SpreadsheetApp.getUi().alert('⚠️ Required columns missing in Clustered_Data (Price, ClusterID).');
+    return;
+  }
+
+  // Control flags (read from Control sheet if present)
+  const control = ss.getSheetByName('Control');
+  let usePercentileClamp = false;   // default: false
+  let percentileLow = 5;            // if enabled, clamp lower bound at P5
+  let percentileHigh = 95;          // if enabled, clamp upper bound at P95
+  let minClusterSizeForTrim = 5;    // minimum cluster size to perform trimming
+  if (control) {
+    const cvals = control.getDataRange().getValues();
+    for (let i = 0; i < cvals.length; i++) {
+      const key = (cvals[i][0] || '').toString().trim().toLowerCase();
+      const val = cvals[i][1];
+      if (key === 'use_percentile_clamp') usePercentileClamp = (val === true || String(val).toLowerCase() === 'true');
+      if (key === 'percentile_low') percentileLow = Number(val) || percentileLow;
+      if (key === 'percentile_high') percentileHigh = Number(val) || percentileHigh;
+      if (key === 'min_cluster_size_for_trim') minClusterSizeForTrim = Number(val) || minClusterSizeForTrim;
+    }
+  }
+
+  // Group rows by cluster rank (ClusterID is centroid index, but we've got Tier_Label and ClusterID)
+  const clusters = {}; // key = clusterId, value = array of rows (full row arrays)
+  rows.forEach(r => {
+    const clusterId = r[idxClusterID];
+    if (clusterId === '' || clusterId === null || clusterId === undefined) return;
+    if (!clusters[clusterId]) clusters[clusterId] = [];
+    clusters[clusterId].push(r);
+  });
+
+  // Prepare Cluster_Bands sheet
+  const bandsSheet = ss.getSheetByName('Cluster_Bands') || ss.insertSheet('Cluster_Bands');
+  bandsSheet.clear();
+  const bandHeaders = ['ClusterID','Tier_Label','Count','Centroid','MinPrice','MaxPrice','Q1','Q3','IQR','BandLow','BandHigh','P5','P95'];
+  bandsSheet.getRange(1,1,1,bandHeaders.length).setValues([bandHeaders]);
+
+  // Prepare Cluster_Trimmed sheet
+  const trimmedSheet = ss.getSheetByName('Cluster_Trimmed') || ss.insertSheet('Cluster_Trimmed');
+  trimmedSheet.clear();
+  const outHeaders = headers.concat(['Cluster_BandLow','Cluster_BandHigh','InBand']);
+  trimmedSheet.getRange(1,1,1,outHeaders.length).setValues([outHeaders]);
+
+  const clusterSummary = [];
+  const trimmedRows = [];
+
+  // iterate clusters, compute stats and filter
+  Object.keys(clusters).forEach(cid => {
+    const cRows = clusters[cid];
+    const prices = cRows.map(r => parseFloat(r[idxPrice])).filter(v => !isNaN(v) && v > 0).sort((a,b)=>a-b);
+    const count = prices.length;
+    const centroid = (count>0) ? median(prices) : 0;
+    const minP = (count>0) ? prices[0] : 0;
+    const maxP = (count>0) ? prices[prices.length-1] : 0;
+    const q1 = (count>0) ? percentile(prices,25) : 0;
+    const q3 = (count>0) ? percentile(prices,75) : 0;
+    const iqr = q3 - q1;
+    let bandLow = q1 - 1.5 * iqr;
+    let bandHigh = q3 + 1.5 * iqr;
+
+    // Optional percentile clamp
+    let p5 = null, p95 = null;
+    if (usePercentileClamp && count > 0) {
+      p5 = percentile(prices, percentileLow);
+      p95 = percentile(prices, percentileHigh);
+      bandLow = Math.max(bandLow, p5);
+      bandHigh = Math.min(bandHigh, p95);
+    } else {
+      p5 = percentile(prices, 5);
+      p95 = percentile(prices, 95);
+    }
+
+    // If cluster too small, avoid trimming aggressively — fallback to min/max
+    if (count < minClusterSizeForTrim) {
+      bandLow = minP;
+      bandHigh = maxP;
+    }
+
+    // Save cluster summary row
+    // Tier_Label: pick first row's Tier_Label if present
+    const tierLabel = (cRows[0] && cRows[0][idxTierLabel]) ? cRows[0][idxTierLabel] : '';
+    clusterSummary.push([cid, tierLabel, count, Number(centroid.toFixed(2)), Number(minP.toFixed(2)), Number(maxP.toFixed(2)), Number(q1.toFixed(2)), Number(q3.toFixed(2)), Number(iqr.toFixed(2)), Number(bandLow.toFixed(2)), Number(bandHigh.toFixed(2)), Number(p5.toFixed(2)), Number(p95.toFixed(2))]);
+
+    // Filter rows in this cluster to those within [bandLow, bandHigh]
+    cRows.forEach(r => {
+      const p = parseFloat(r[idxPrice]);
+      const inBand = (!isNaN(p) && p >= bandLow && p <= bandHigh) ? 'YES' : 'NO';
+      const outRow = r.slice(); // copy original row
+      outRow.push(Number(bandLow.toFixed(2)), Number(bandHigh.toFixed(2)), inBand);
+      if (inBand === 'YES') trimmedRows.push(outRow);
+    });
+  });
+
+  // Write Cluster_Bands
+  if (clusterSummary.length) bandsSheet.getRange(2,1,clusterSummary.length,clusterSummary[0].length).setValues(clusterSummary);
+  bandsSheet.autoResizeColumns(1,bandHeaders.length);
+
+  // Write Cluster_Trimmed
+  if (trimmedRows.length) trimmedSheet.getRange(2,1,trimmedRows.length,outHeaders.length).setValues(trimmedRows);
+  trimmedSheet.autoResizeColumns(1,outHeaders.length);
+
+  // Log summary
+  const now = new Date();
+  const totalRows = rows.length;
+  const kept = trimmedRows.length;
+  const removed = totalRows - kept;
+  const logMsg = `ClusterBoundsTrim — TotalRows:${totalRows}, Kept:${kept}, Removed:${removed}, Clusters:${Object.keys(clusters).length}`;
+  logs.appendRow([now, 'mapClusterBoundsAndTrim', logMsg, JSON.stringify(clusterSummary)]);
+
+  SpreadsheetApp.getUi().alert(`✅ Cluster bounds mapped and trimming applied.\nTotal rows: ${totalRows}\nKept: ${kept}\nRemoved: ${removed}\nSee Cluster_Bands and Cluster_Trimmed sheets.`);
+}
+
+/* Helpers: median + percentile (reused) */
+function median(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const s = arr.slice().sort((a,b)=>a-b);
+  const m = Math.floor(s.length/2);
+  return s.length % 2 === 0 ? (s[m-1] + s[m]) / 2 : s[m];
+}
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  const pos = (p / 100) * (arr.length - 1);
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return (arr[base + 1] !== undefined)
+    ? arr[base] + rest * (arr[base + 1] - arr[base])
+    : arr[base];
+}
+
+
+/**
+ * runBrandAggregation()
+ * Aggregates brand-level stats from the canonical base dataset (Outlier_Trimmed / Trimmed_Filtered / ...)
+ * Writes Brand_Aggregation sheet with one row per normalized brand.
+ * Columns: Brand, n_listings, median_price, avg_rating, total_reviews, std_price, min_price, max_price, Brand_Tier (placeholder)
+ */
+function runBrandAggregation() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+  const base = getBaseDataSheet();
+  if (!base) {
+    SpreadsheetApp.getUi().alert('⚠️ No valid base dataset found for brand aggregation. Run filtering + trimming first.');
+    logs.appendRow([new Date(), 'runBrandAggregation', 'SKIPPED - no base data', '']);
+    return;
+  }
+
+  const vals = base.getDataRange().getValues();
+  if (!vals || vals.length <= 1) {
+    SpreadsheetApp.getUi().alert('⚠️ Base dataset is empty. Nothing to aggregate.');
+    logs.appendRow([new Date(), 'runBrandAggregation', 'SKIPPED - empty base', '']);
+    return;
+  }
+
+  const headers = vals[0].map(h => h.toString().trim());
+  const rows = vals.slice(1);
+
+  // find indices (best-effort)
+  const idxBrand = headers.indexOf('Brand') !== -1 ? headers.indexOf('Brand') : headers.indexOf('brand');
+  const idxPrice = headers.indexOf('Price') !== -1 ? headers.indexOf('Price') : headers.indexOf('price');
+  const idxRating = headers.indexOf('Rating') !== -1 ? headers.indexOf('Rating') : headers.indexOf('rating');
+  const idxReviews = headers.indexOf('Reviews') !== -1 ? headers.indexOf('Reviews') : headers.indexOf('review_count') || headers.indexOf('reviews');
+
+  if (idxBrand === -1 || idxPrice === -1) {
+    SpreadsheetApp.getUi().alert('Brand_Aggregation requires Brand and Price columns in the base dataset.');
+    logs.appendRow([new Date(), 'runBrandAggregation', 'ERROR - missing Brand or Price columns', '']);
+    return;
+  }
+
+  // normalize helper
+  function norm(s){ return (s||'').toString().trim().toLowerCase().replace(/[^a-z0-9]/g,''); }
+
+  // Aggregate by normalized brand key
+  const brandMap = {}; // key -> { rawNames:Set, prices:[], ratings:[], reviewsSum:0 }
+  rows.forEach(r => {
+    const rawBrand = (r[idxBrand] || '').toString().trim();
+    const bkey = norm(rawBrand);
+    const price = Number(r[idxPrice]) || 0;
+    if (!bkey || price <= 0) return;
+    if (!brandMap[bkey]) brandMap[bkey] = { rawNames: {}, prices: [], ratings: [], reviews: 0, n: 0 };
+    brandMap[bkey].rawNames[rawBrand] = true;
+    brandMap[bkey].prices.push(price);
+    brandMap[bkey].n += 1;
+    if (idxRating !== -1) {
+      const rt = Number(r[idxRating]) || 0;
+      if (rt > 0) brandMap[bkey].ratings.push(rt);
+    }
+    if (idxReviews !== -1) {
+      const rv = Number(r[idxReviews]) || 0;
+      brandMap[bkey].reviews += rv;
+    }
+  });
+
+  // Build brand rows
+  const brandRows = [];
+  Object.keys(brandMap).forEach(k => {
+    const rec = brandMap[k];
+    const repName = Object.keys(rec.rawNames)[0] || k;
+    const medianPrice = median(rec.prices);
+    const avgRating = rec.ratings.length ? (rec.ratings.reduce((a,b)=>a+b,0)/rec.ratings.length) : 0;
+    const stdPrice = rec.prices.length ? (function(a){
+      const mean = a.reduce((x,y)=>x+y,0)/a.length;
+      return Math.sqrt(a.reduce((s,v)=>s+Math.pow(v-mean,2),0)/a.length);
+    })(rec.prices) : 0;
+    const minP = Math.min.apply(null, rec.prices);
+    const maxP = Math.max.apply(null, rec.prices);
+    brandRows.push([repName, rec.n, Number(medianPrice.toFixed(2)), Number(avgRating.toFixed(2)), rec.reviews, Number(stdPrice.toFixed(2)), Number(minP.toFixed(2)), Number(maxP.toFixed(2)), '', 0]); // placeholder Brand_Tier & DQS
+  });
+
+  // Sort by median price asc
+  brandRows.sort((a,b) => a[2] - b[2]);
+
+  // Optional: compute simple Brand_Tier using quartiles (Entry/Mass/Mid-Premium/Premium)
+  const nBrands = brandRows.length;
+  const q1 = Math.floor(nBrands * 0.25);
+  const q2 = Math.floor(nBrands * 0.5);
+  const q3 = Math.floor(nBrands * 0.75);
+  for (let i=0;i<brandRows.length;i++){
+    let tier = 'Entry';
+    if (i >= q3) tier = 'Premium';
+    else if (i >= q2) tier = 'Mid-Premium';
+    else if (i >= q1) tier = 'Mass';
+    brandRows[i][8] = tier;
+  }
+
+  // Build final header and write Brand_Aggregation
+  const outHdr = ['Brand','n_listings','median_price','avg_rating','total_reviews','std_price','min_price','max_price','Brand_Tier','DQS'];
+  let out = ss.getSheetByName('Brand_Aggregation');
+  if (!out) out = ss.insertSheet('Brand_Aggregation');
+  out.clear();
+  out.getRange(1,1,1,outHdr.length).setValues([outHdr]);
+  if (brandRows.length) out.getRange(2,1,brandRows.length,outHdr.length).setValues(brandRows);
+  out.autoResizeColumns(1,outHdr.length);
+
+  logs.appendRow([new Date(), 'runBrandAggregation', `Aggregated ${brandRows.length} brands from ${base.getName()}`, 'OK']);
+  SpreadsheetApp.getUi().alert(`Brand_Aggregation written — ${brandRows.length} brands from ${base.getName()}.`);
+}
+
+/* median helper reused */
+function median(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const s = arr.slice().sort((a,b)=>a-b);
+  const mid = Math.floor(s.length/2);
+  return s.length % 2 === 0 ? (s[mid-1] + s[mid]) / 2 : s[mid];
+}
+/**
+ * MODULE 6: Competitive Composite Score (CCS v2)
+ * ----------------------------------------------
+ * Inputs  : Trimmed / Clustered / Raw data (brand-level not required)
+ * Features: Price, Reviews, BSR, Position, Is Sponsored
+ * Control : w_p, w_rv, w_bsr, w_pos, w_sp  (+ DQS if present)
+ * Output  : CCS_Results sheet with normalized components and final CCS_v2
+ */
+
+function computeCCS_v2() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+
+  // Pick best available sheet for CCS calc
+  const srcNames = ['Cluster_Trimmed', 'Clustered_Data', 'Outlier_Trimmed', 'Trimmed_Data', 'Raw_Data'];
+  let src = null, srcName = '';
+  for (const n of srcNames) {
+    const s = ss.getSheetByName(n);
+    if (s) { src = s; srcName = n; break; }
+  }
+  if (!src) {
+    SpreadsheetApp.getUi().alert('⚠️ No valid source sheet found for CCS.');
+    return;
+  }
+
+  const data = src.getDataRange().getValues();
+  if (data.length <= 1) {
+    SpreadsheetApp.getUi().alert(`⚠️ ${srcName} is empty.`);
+    return;
+  }
+
+  const headers = data[0].map(h => h.toString().trim());
+  const rows = data.slice(1);
+
+  const idx = {
+    product: headers.indexOf('Product Name'),
+    price: headers.indexOf('Price'),
+    reviews: headers.indexOf('Reviews'),
+    bsr: headers.indexOf('BSR'),
+    pos: headers.indexOf('Position'),
+    sp: headers.indexOf('Is Sponsored'),
+    dqs: headers.indexOf('DQS')
+  };
+  if (idx.price === -1 || idx.reviews === -1 || idx.bsr === -1 || idx.pos === -1 || idx.sp === -1) {
+    SpreadsheetApp.getUi().alert('⚠️ Required columns missing (Price, Reviews, BSR, Position, Is Sponsored).');
+    return;
+  }
+
+  // Control weights
+  const control = ss.getSheetByName('Control');
+  const weights = { w_p:0.3, w_rv:0.2, w_bsr:0.25, w_pos:0.15, w_sp:0.1 };
+  if (control) {
+    const cvals = control.getDataRange().getValues();
+    cvals.forEach(r => {
+      const k = (r[0]||'').toString().trim().toLowerCase();
+      const v = Number(r[1]);
+      if (!isNaN(v)) {
+        if (k==='w_p') weights.w_p=v;
+        if (k==='w_rv') weights.w_rv=v;
+        if (k==='w_bsr') weights.w_bsr=v;
+        if (k==='w_pos') weights.w_pos=v;
+        if (k==='w_sp') weights.w_sp=v;
+      }
+    });
+  }
+
+  // Extract numeric arrays (skip zeros/NaN for scaling)
+  const extract = colIdx => rows.map(r => parseFloat(r[colIdx])||0).filter(v=>v>0);
+  const prices   = extract(idx.price);
+  const reviews  = extract(idx.reviews);
+  const bsrs     = extract(idx.bsr);
+  const posVals  = extract(idx.pos);
+
+  const minmax = arr => [Math.min(...arr), Math.max(...arr)];
+  const [pMin,pMax]   = minmax(prices);
+  const [rvMin,rvMax] = minmax(reviews);
+  const [bMin,bMax]   = minmax(bsrs);
+  const [posMin,posMax]= minmax(posVals);
+
+  const outRows = [];
+
+  rows.forEach(r=>{
+    const price = parseFloat(r[idx.price])||0;
+    const rv    = parseFloat(r[idx.reviews])||0;
+    const bsr   = parseFloat(r[idx.bsr])||0;
+    const pos   = parseFloat(r[idx.pos])||0;
+    const spStr = (r[idx.sp]||'').toString().trim().toLowerCase();
+    const isSponsored = (spStr==='yes'||spStr==='true'||spStr==='1') ? 1 : 0;
+    const dqs = idx.dqs!==-1 ? (parseFloat(r[idx.dqs])||1) : 1;
+
+    // Normalizations (log for skewed)
+    const ln = Math.log;
+    const norm = (x,min,max)=> (max===min)?0.5:(x-min)/(max-min);
+
+    const pNorm  = 1 - norm(ln(price||1), ln(pMin||1), ln(pMax||1)); // cheaper = higher
+    const rvNorm = norm(ln(1+rv), ln(1+rvMin), ln(1+rvMax));
+    const bsrNorm= 1 - norm(ln(bsr||1), ln(bMin||1), ln(bMax||1));   // lower bsr better
+    const posNorm= 1 - norm(pos, posMin, posMax);                    // lower pos better
+    const spNorm = 1 - isSponsored;                                  // organic=1
+
+    const rawScore = (
+      weights.w_p*pNorm +
+      weights.w_rv*rvNorm +
+      weights.w_bsr*bsrNorm +
+      weights.w_pos*posNorm +
+      weights.w_sp*spNorm
+    );
+    const CCS = rawScore * dqs;
+
+    outRows.push([
+      r[idx.product] || '',
+      price, rv, bsr, pos, isSponsored,
+      Number(pNorm.toFixed(3)),
+      Number(rvNorm.toFixed(3)),
+      Number(bsrNorm.toFixed(3)),
+      Number(posNorm.toFixed(3)),
+      Number(spNorm.toFixed(3)),
+      Number(rawScore.toFixed(3)),
+      Number(CCS.toFixed(3))
+    ]);
+  });
+
+  // Write results
+  const outSheet = ss.getSheetByName('CCS_Results') || ss.insertSheet('CCS_Results');
+  outSheet.clear();
+  const header = [
+    'Product','Price','Reviews','BSR','Position','IsSponsored',
+    'Price_norm','Reviews_norm','BSR_norm','Position_norm','Sponsored_norm',
+    'RawScore','CCS_v2'
+  ];
+  outSheet.getRange(1,1,1,header.length).setValues([header]);
+  outSheet.getRange(2,1,outRows.length,header.length).setValues(outRows);
+  outSheet.autoResizeColumns(1,header.length);
+
+  const now = new Date();
+  logs.appendRow([now,'computeCCS_v2',`Rows:${outRows.length}, Source:${srcName}`, 'OK']);
+  SpreadsheetApp.getUi().alert(`✅ CCS_v2 computed from ${srcName}\nRows processed: ${outRows.length}`);
+}
+/**
+ * MODULE 7: Brand-level CCS Aggregation (Merged into Brand_Aggregation)
+ * -------------------------------------------------------------
+ * - Reads CCS_Results (SKU-level CCS)
+ * - Groups by Brand → computes avg_CCS, median_CCS, max_CCS, weighted_CCS
+ * - Merges results into existing Brand_Aggregation (adds/updates CCS columns)
+ * - Adds Brand_Tier by CCS quartiles (Entry / Mass / Mid-Premium / Premium)
+ */
+
+function computeBrandCCS() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+
+  // Step 1: Find source sheet for product-brand mapping
+  const srcNames = ['Cluster_Trimmed', 'Clustered_Data', 'Outlier_Trimmed', 'Trimmed_Data', 'Raw_Data'];
+  let src = null, srcName = '';
+  for (const n of srcNames) {
+    const s = ss.getSheetByName(n);
+    if (s) { src = s; srcName = n; break; }
+  }
+  if (!src) {
+    SpreadsheetApp.getUi().alert('⚠️ No source sheet available to map products to brands.');
+    return;
+  }
+
+  const srcData = src.getDataRange().getValues();
+  const srcHeaders = srcData[0].map(h => h.toString().trim());
+  const srcRows = srcData.slice(1);
+  const idxProductName = srcHeaders.indexOf('Product Name') !== -1 ? srcHeaders.indexOf('Product Name') : srcHeaders.indexOf('Product');
+  const idxBrand = srcHeaders.indexOf('Brand');
+  if (idxProductName === -1 || idxBrand === -1) {
+    SpreadsheetApp.getUi().alert('⚠️ Source must contain Product Name and Brand columns.');
+    return;
+  }
+
+  // Build product → brand map
+  const productToBrand = {};
+  srcRows.forEach(r => {
+    const p = (r[idxProductName] || '').toString().trim();
+    if (p) productToBrand[p] = (r[idxBrand] || '').toString().trim() || '(unknown)';
+  });
+
+  // Step 2: Read CCS_Results
+  const ccsSheet = ss.getSheetByName('CCS_Results');
+  if (!ccsSheet) {
+    SpreadsheetApp.getUi().alert('⚠️ CCS_Results not found. Run Compute CCS v2 first.');
+    return;
+  }
+
+  const ccsData = ccsSheet.getDataRange().getValues();
+  if (ccsData.length <= 1) {
+    SpreadsheetApp.getUi().alert('⚠️ CCS_Results is empty.');
+    return;
+  }
+
+  const ccsHeaders = ccsData[0].map(h => h.toString().trim());
+  const ccsRows = ccsData.slice(1);
+  const idxProduct = ccsHeaders.indexOf('Product') !== -1 ? ccsHeaders.indexOf('Product') : 0;
+  const idxCCS = ccsHeaders.indexOf('CCS_v2');
+  const idxReviews = ccsHeaders.indexOf('Reviews') !== -1 ? ccsHeaders.indexOf('Reviews') : -1;
+  if (idxCCS === -1) {
+    SpreadsheetApp.getUi().alert('⚠️ CCS_v2 column missing.');
+    return;
+  }
+
+  // Step 3: Aggregate per brand
+  const brands = {};
+  ccsRows.forEach(r => {
+    const product = (r[idxProduct] || '').toString().trim();
+    const ccsVal = parseFloat(r[idxCCS]) || 0;
+    const reviews = (idxReviews !== -1) ? (parseFloat(r[idxReviews]) || 0) : 0;
+    const brand = productToBrand[product] || '(unknown)';
+    if (!brands[brand]) brands[brand] = { ccs: [], reviews: [] };
+    brands[brand].ccs.push(ccsVal);
+    brands[brand].reviews.push(reviews);
+  });
+
+  if (Object.keys(brands).length === 0) {
+    SpreadsheetApp.getUi().alert('⚠️ No brand mappings found.');
+    return;
+  }
+
+  // Step 4: Compute aggregates
+  const agg = [];
+  Object.keys(brands).forEach(b => {
+    const ccsArr = brands[b].ccs;
+    if (!ccsArr.length) return;
+    const revArr = brands[b].reviews;
+    const n = ccsArr.length;
+    const avg = sum(ccsArr) / n;
+    const med = median(ccsArr);
+    const max = Math.max(...ccsArr);
+    let weightedSum = 0, totalW = 0;
+    for (let i = 0; i < ccsArr.length; i++) {
+      const w = revArr[i] && revArr[i] > 0 ? revArr[i] : 1;
+      weightedSum += ccsArr[i] * w;
+      totalW += w;
+    }
+    const weighted = totalW ? (weightedSum / totalW) : avg;
+    agg.push([b, avg, med, max, weighted]);
+  });
+
+  // Step 5: Tier mapping
+  const avgArr = agg.map(r => r[1]);
+  avgArr.sort((a, b) => a - b);
+  const q25 = percentile(avgArr, 25);
+  const q50 = percentile(avgArr, 50);
+  const q75 = percentile(avgArr, 75);
+
+  // Step 6: Merge into Brand_Aggregation
+  const sheet = ss.getSheetByName('Brand_Aggregation');
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('⚠️ Brand_Aggregation not found. Run Run Brand Aggregation first.');
+    return;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0].map(h => h.toString().trim());
+  const rows = data.slice(1);
+
+  const idxBrandAgg = headers.indexOf('Brand');
+  const colMap = { avg: 'avg_CCS', med: 'median_CCS', max: 'max_CCS', weighted: 'weighted_CCS', tier: 'Brand_Tier' };
+  const newCols = Object.values(colMap);
+
+  // Add missing columns if not present
+  newCols.forEach(col => {
+    if (!headers.includes(col)) headers.push(col);
+  });
+
+  const brandAggMap = {};
+  agg.forEach(r => {
+    const brand = r[0];
+    const avg = r[1];
+    const med = r[2];
+    const max = r[3];
+    const weighted = r[4];
+    let tier = '';
+    if (avg <= q25) tier = 'Entry';
+    else if (avg <= q50) tier = 'Mass';
+    else if (avg <= q75) tier = 'Mid-Premium';
+    else tier = 'Premium';
+    brandAggMap[brand] = { avg, med, max, weighted, tier };
+  });
+
+  const updated = rows.map(r => {
+    const brand = (r[idxBrandAgg] || '').toString().trim();
+    const base = brandAggMap[brand];
+    if (!base) return r.concat(['','','','','']); // preserve row if brand missing
+    return [
+      ...r.slice(0, headers.length - newCols.length),
+      base.avg || '',
+      base.med || '',
+      base.max || '',
+      base.weighted || '',
+      base.tier || ''
+    ];
+  });
+
+  // Step 7: Write updated Brand_Aggregation
+  sheet.clear();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(2, 1, updated.length, headers.length).setValues(updated);
+  sheet.autoResizeColumns(1, headers.length);
+
+  // Log
+  const now = new Date();
+  logs.appendRow([now, 'computeBrandCCS', `Merged into Brand_Aggregation, Brands:${agg.length}`, 'OK']);
+  SpreadsheetApp.getUi().alert(`✅ Brand-level CCS merged into Brand_Aggregation\nBrands updated: ${agg.length}`);
+}
+
+/* Helpers */
+function sum(arr){ return arr.reduce((s,x)=>s+(Number(x)||0),0); }
+function median(arr){
+  const s = arr.slice().sort((a,b)=>a-b);
+  const m = Math.floor(s.length/2);
+  return s.length % 2 === 0 ? (s[m-1]+s[m])/2 : s[m];
+}
+function percentile(arr, p){
+  if (!arr.length) return 0;
+  const pos = (p/100)*(arr.length-1);
+  const base = Math.floor(pos);
+  const rest = pos-base;
+  return (arr[base+1]!==undefined)?arr[base]+rest*(arr[base+1]-arr[base]):arr[base];
+}
+/**
+ * Reconcile Brand_Tier sensibly:
+ * 1) Prefer top_tier_label (sku cluster)
+ * 2) Else assign by median_price quartiles (price-based)
+ * Writes Brand_Tier and Tier_Source into Brand_Aggregation
+ */
+function reconcileBrandTier_priceFirst() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Brand_Aggregation');
+  if (!sheet) { SpreadsheetApp.getUi().alert('Brand_Aggregation not found'); return; }
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0].map(h => h.toString().trim());
+  let rows = data.slice(1);
+
+  const idxBrand = headers.indexOf('Brand');
+  const idxTopTier = headers.indexOf('top_tier_label');
+  const idxMedianPrice = headers.indexOf('median_price');
+  let idxBrandTier = headers.indexOf('Brand_Tier');
+  let idxTierSource = headers.indexOf('Tier_Source');
+
+  // add columns if missing
+  if (idxBrandTier === -1) { headers.push('Brand_Tier'); idxBrandTier = headers.length - 1; }
+  if (idxTierSource === -1) { headers.push('Tier_Source'); idxTierSource = headers.length - 1; }
+
+  // collect median prices for price-based tiering
+  const priceList = rows.map(r => parseFloat(r[idxMedianPrice]) || 0).filter(v => v > 0);
+  if (priceList.length === 0) {
+    SpreadsheetApp.getUi().alert('No median_price values found for price-based tiering.');
+    return;
+  }
+  priceList.sort((a,b)=>a-b);
+  const q25 = percentile(priceList, 25);
+  const q50 = percentile(priceList, 50);
+  const q75 = percentile(priceList, 75);
+
+  // map rows
+  const updated = rows.map(r => {
+    const top = idxTopTier !== -1 ? (r[idxTopTier] || '').toString().trim() : '';
+    const medP = parseFloat(r[idxMedianPrice]) || 0;
+    let tier='', source='';
+
+    if (top) {
+      tier = top;
+      source = 'sku_cluster';
+    } else if (medP > 0) {
+      // price-based quartile mapping
+      if (medP <= q25) tier = 'Entry';
+      else if (medP <= q50) tier = 'Mass';
+      else if (medP <= q75) tier = 'Mid-Premium';
+      else tier = 'Premium';
+      source = 'price_quartile';
+    } else {
+      tier = 'Unknown';
+      source = 'no_data';
+    }
+
+    // ensure row is long enough
+    const out = r.slice();
+    while (out.length < headers.length) out.push('');
+    out[idxBrandTier] = tier;
+    out[idxTierSource] = source;
+    return out;
+  });
+
+  // write back
+  sheet.clear();
+  sheet.getRange(1,1,1,headers.length).setValues([headers]);
+  if (updated.length) sheet.getRange(2,1,updated.length,headers.length).setValues(updated);
+  sheet.autoResizeColumns(1, headers.length);
+
+  SpreadsheetApp.getUi().alert('✅ Brand_Tier reconciled (sku_cluster preferred; fallback=price quartiles).');
+}
+
+/* helper percentile used above (same as other modules) */
+function percentile(arr, p){
+  if (!arr || arr.length === 0) return 0;
+  const pos = (p/100) * (arr.length - 1);
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return (arr[base+1] !== undefined) ? arr[base] + rest * (arr[base+1] - arr[base]) : arr[base];
+}
+// Stub 1: Validate S2C Prices (Use Case 1) - safe starter (creates headers)
+function validateS2CPrices() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const out = ss.getSheetByName('S2C_Validation') || ss.insertSheet('S2C_Validation');
+  out.clear();
+  const headers = ['S2C_SKU','Brand','Tier','Tier_Median','Competitor_Median','Delta_%','Position','Validation_Flag','Note','Source_Sheet','Run_TS'];
+  out.getRange(1,1,1,headers.length).setValues([headers]);
+  out.getRange(2,1,1,headers.length).setValues([['(Run this function to populate rows)','', '','', '','','','','','', new Date()]]);
+  SpreadsheetApp.getUi().alert('S2C_Validation stub created — ready for full implementation.');
+}
+
+// Stub 2: Recommend New Product Price (Use Case 2) - safe starter (creates headers)
+function recommendNewProductPrice() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const out = ss.getSheetByName('Price_Recommendation') || ss.insertSheet('Price_Recommendation');
+  out.clear();
+  const headers = ['Product','Strategy','Target_Set','Include_Terms','Exclude_Terms','Tier','Tier_Median','BreakEven','Raw_Recommend','Strategy_Adjusted','Final_Recommend','Delta_vs_Competitor','Note','Source_Sheet','Run_TS'];
+  out.getRange(1,1,1,headers.length).setValues([headers]);
+  out.getRange(2,1,1,headers.length).setValues([['(Run this function to populate rows)','','','','','','','','','','','','', new Date()]]);
+  SpreadsheetApp.getUi().alert('Price_Recommendation stub created — ready for full implementation.');
+}
+/**
+ * MODULE 9: validateS2CPrices()
+ * ------------------------------
+ * Compares S2C SKUs against competitive set for pricing validation.
+ * Uses Brand_Aggregation to get Tier medians.
+ * Writes results to S2C_Validation tab.
+ */
+function validateS2CPrices() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+  const control = ss.getSheetByName('Control');
+  const brandAgg = ss.getSheetByName('Brand_Aggregation');
+  const raw = ss.getSheetByName('Raw_Data');
+  const out = ss.getSheetByName('S2C_Validation') || ss.insertSheet('S2C_Validation');
+  out.clear();
+
+  // ----------------------------
+  // 1. Control parameters
+  // ----------------------------
+  let brandName = "S2C";
+  let topN = 100;
+  if (control) {
+    const vals = control.getDataRange().getValues();
+    vals.forEach(r=>{
+      const k=(r[0]||'').toString().trim().toLowerCase();
+      const v=(r[1]||'').toString().trim();
+      if (k==='brand_name') brandName=v;
+      if (k==='target_set') topN=parseInt(v)||100;
+    });
+  }
+
+  // ----------------------------
+  // 2. Load Raw_Data
+  // ----------------------------
+  const data = raw.getDataRange().getValues();
+  const headers = data[0].map(h => h.toString().trim());
+  const rows = data.slice(1);
+  const idxBrand = headers.indexOf('Brand');
+  const idxProduct = headers.indexOf('Product Name');
+  const idxPrice = headers.indexOf('Price');
+
+  if (idxBrand === -1 || idxProduct === -1 || idxPrice === -1) {
+    SpreadsheetApp.getUi().alert('⚠️ Raw_Data missing Brand or Price columns.');
+    return;
+  }
+
+  // Split into S2C listings and competitors
+  const s2cRows = rows.filter(r => (r[idxBrand]||'').toString().trim().toUpperCase() === brandName.toUpperCase());
+  const compRows = rows.filter(r => (r[idxBrand]||'').toString().trim().toUpperCase() !== brandName.toUpperCase());
+
+  if (s2cRows.length === 0) {
+    SpreadsheetApp.getUi().alert(`⚠️ No listings found for brand ${brandName}.`);
+    return;
+  }
+
+  // Sort competitors by Position (if available)
+  const idxPos = headers.indexOf('Position');
+  if (idxPos !== -1) {
+    compRows.sort((a,b)=>(parseFloat(a[idxPos])||99999)-(parseFloat(b[idxPos])||99999));
+  }
+
+  // Limit to Top N competitors
+  const topCompetitors = compRows.slice(0, topN);
+
+  // ----------------------------
+  // 3. Compute medians per tier from Brand_Aggregation
+  // ----------------------------
+  const aggVals = brandAgg.getDataRange().getValues();
+  const aggHdr = aggVals[0].map(h=>h.toString().trim());
+  const aggRows = aggVals.slice(1);
+  const idxTier = aggHdr.indexOf('Brand_Tier');
+  const idxMedPrice = aggHdr.indexOf('median_price');
+  if (idxTier === -1 || idxMedPrice === -1) {
+    SpreadsheetApp.getUi().alert('⚠️ Brand_Aggregation missing Brand_Tier or median_price.');
+    return;
+  }
+
+  const tierGroups = {};
+  aggRows.forEach(r=>{
+    const tier = (r[idxTier]||'').toString().trim();
+    const price = parseFloat(r[idxMedPrice])||0;
+    if (!tierGroups[tier]) tierGroups[tier]=[];
+    if (price>0) tierGroups[tier].push(price);
+  });
+  const tierMedians={};
+  Object.keys(tierGroups).forEach(t=>{
+    tierMedians[t]=median(tierGroups[t]);
+  });
+
+  // Compute overall competitor median
+  // sort by position if present
+if (idxPos !== -1) matches.sort((a,b)=>(parseFloat(a[idxPos])||99999)-(parseFloat(b[idxPos])||99999));
+
+// take top N based on targetSet
+const topMatches = matches.slice(0, topN);
+  const compPrices = topCompetitors.map(r=>parseFloat(r[idxPrice])||0).filter(v=>v>0);
+  const competitorMedian = compPrices.length ? median(compPrices) : 0;
+
+  // ----------------------------
+  // 4. Compare S2C vs Tier & Competitors
+  // ----------------------------
+  const output=[];
+  s2cRows.forEach(r=>{
+    const product = (r[idxProduct]||'').toString().trim();
+    const price = parseFloat(r[idxPrice])||0;
+    const brandTierRow = aggRows.find(x => (x[aggHdr.indexOf('Brand')]||'').toString().trim().toUpperCase() === brandName.toUpperCase());
+    const tier = brandTierRow ? (brandTierRow[idxTier]||'').toString().trim() : 'Unknown';
+    const tierMed = tierMedians[tier] || 0;
+    const deltaPct = tierMed ? ((price - tierMed)/tierMed)*100 : 0;
+    let position='', flag='';
+    if (deltaPct <= -15) { position='Below Market'; flag='🔵 Undervalued'; }
+    else if (deltaPct > -15 && deltaPct <= 10) { position='Aligned'; flag='✅ Good'; }
+    else if (deltaPct > 10 && deltaPct <= 25) { position='Slightly Above'; flag='⚠️ Check'; }
+    else if (deltaPct > 25) { position='Overpriced'; flag='🔴 Risky'; }
+    else { position='Unknown'; flag=''; }
+
+    const note = `Tier median=${tierMed.toFixed(2)}, Competitor median=${competitorMedian.toFixed(2)}`;
+    output.push([product,brandName,tier,price,tierMed,competitorMedian,deltaPct.toFixed(1)+'%',position,flag,note]);
+  });
+
+  // ----------------------------
+  // 5. Write Results
+  // ----------------------------
+  const outHeaders = ['S2C_SKU','Brand','Tier','S2C_Price','Tier_Median','Competitor_Median','Delta_%','Position','Validation_Flag','Note'];
+  out.getRange(1,1,1,outHeaders.length).setValues([outHeaders]);
+  out.getRange(2,1,output.length,outHeaders.length).setValues(output);
+  out.autoResizeColumns(1,outHeaders.length);
+
+  const now = new Date();
+  logs.appendRow([now,'validateS2CPrices',`S2C SKUs:${s2cRows.length}`, 'OK']);
+  SpreadsheetApp.getUi().alert(`✅ S2C Price Validation complete.\nAnalysed ${s2cRows.length} SKUs vs Top ${topN} competitors.`);
+}
+
+/* Reuse existing helper if not already declared */
+function median(arr){
+  if (!arr || arr.length===0) return 0;
+  const s=arr.slice().sort((a,b)=>a-b);
+  const m=Math.floor(s.length/2);
+  return s.length%2===0?(s[m-1]+s[m])/2:s[m];
+}
+/**
+ * Helper: buildDynamicTierMedians(filteredRows, headers)
+ * Rebuilds contextual tier medians from the filtered dataset (include/exclude/category applied)
+ * Output: { Entry: X, Mass: Y, "Mid-Premium": Z, Premium: W }
+ */
+function buildDynamicTierMedians(filteredRows, headers) {
+  if (!filteredRows || filteredRows.length === 0) return {};
+
+  const idxBrand = headers.indexOf('Brand');
+  const idxPrice = headers.indexOf('Price');
+  if (idxBrand === -1 || idxPrice === -1) return {};
+
+  // Step 1️⃣ Aggregate by brand → median price per brand
+  const brandMap = {};
+  filteredRows.forEach(r => {
+    const brand = (r[idxBrand] || '').toString().trim();
+    const price = Number(r[idxPrice]) || 0;
+    if (!brand || price <= 0) return;
+    if (!brandMap[brand]) brandMap[brand] = [];
+    brandMap[brand].push(price);
+  });
+
+  const brandMedians = [];
+  Object.keys(brandMap).forEach(b => {
+    const prices = brandMap[b];
+    const m = median(prices);
+    brandMedians.push({ brand: b, median_price: m });
+  });
+
+  if (brandMedians.length === 0) return {};
+
+  // Step 2️⃣ Sort by median_price ascending
+  brandMedians.sort((a, b) => a.median_price - b.median_price);
+
+  // Step 3️⃣ Split into 4 quantile tiers (Entry, Mass, Mid-Premium, Premium)
+  const n = brandMedians.length;
+  const q1 = Math.floor(n * 0.25);
+  const q2 = Math.floor(n * 0.50);
+  const q3 = Math.floor(n * 0.75);
+
+  const entry = brandMedians.slice(0, q1 || 1).map(x => x.median_price);
+  const mass = brandMedians.slice(q1, q2 || q1 + 1).map(x => x.median_price);
+  const mid = brandMedians.slice(q2, q3 || q2 + 1).map(x => x.median_price);
+  const premium = brandMedians.slice(q3).map(x => x.median_price);
+
+  // Step 4️⃣ Compute tier medians
+  const tierMedians = {
+    'Entry': entry.length ? median(entry) : 0,
+    'Mass': mass.length ? median(mass) : 0,
+    'Mid-Premium': mid.length ? median(mid) : 0,
+    'Premium': premium.length ? median(premium) : 0
+  };
+
+  return tierMedians;
+}
+/**
+ * Full recommendNewProductPrice() — Tier-anchored recommendations with:
+ * - Intended_Tier handling + mismatch/risk flags
+ * - include/exclude/category filtering
+ * - TopN selection by Position
+ * - Sample validation: Total_Matches, Used_Matches, Percent_Used, Competitor_Sample_Warning
+ * - Appends audit row(s) to Price_Recommendation (supports appending multiple runs)
+ */
+function recommendNewProductPrice() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+
+  // --- 1) Read Pricing_Input (assumes parameters in row 2; supports single-row run)
+  const pi = ss.getSheetByName('Pricing_Input');
+  if (!pi) { SpreadsheetApp.getUi().alert('Pricing_Input sheet missing. Create it per spec.'); return; }
+  const piVals = pi.getDataRange().getValues();
+  if (piVals.length < 2) { SpreadsheetApp.getUi().alert('Pricing_Input is empty. Fill row 2 with params.'); return; }
+
+  // Build params map from col A/B
+  const params = {};
+  for (let i = 0; i < piVals.length; i++) {
+    const key = (piVals[i][0] || '').toString().trim();
+    if (!key) continue;
+    params[key.toLowerCase()] = (piVals[i][1] === undefined || piVals[i][1] === '') ? '' : piVals[i][1].toString().trim();
+  }
+
+  // User inputs
+  const brandName = (params['brand_name'] || '').trim();
+  const productName = (params['product_name'] || '').trim() || '(new product)';
+  const strategy = (params['strategy'] || 'align').toLowerCase();
+  const targetSet = (params['target_set'] || 'top75').toLowerCase();
+  const includeTerms = (params['include_terms'] || '').toLowerCase().split(',').map(s=>s.trim()).filter(Boolean);
+  const excludeTerms = (params['exclude_terms'] || '').toLowerCase().split(',').map(s=>s.trim()).filter(Boolean);
+  const breakEven = Number(params['break_even']) || 0;
+  const categoryFilter = (params['category_filter'] || '').toLowerCase().split(',').map(s=>s.trim()).filter(Boolean);
+  const intendedTierRaw = (params['intended_tier'] || 'auto').toString().trim();
+  const intendedTier = intendedTierRaw ? intendedTierRaw : 'auto';
+  const currency = (params['currency'] || '').toString().trim();
+  const bandPct = Number(params['band_pct']) || 0.07; // optional override via Pricing_Input
+
+  // read mismatch threshold & min competitor rows from Control if present
+  let tierMismatchThreshold = 20; // percent
+  let minCompetitorRows = 10;
+  const control = ss.getSheetByName('Control');
+  if (control) {
+    const cvals = control.getDataRange().getValues();
+    cvals.forEach(r => {
+      const k = (r[0]||'').toString().trim().toLowerCase();
+      const v = r[1];
+      if (k === 'tier_mismatch_threshold') {
+        const num = Number(v);
+        if (!isNaN(num)) tierMismatchThreshold = num;
+      }
+      if (k === 'min_competitor_rows') {
+        const num = Number(v);
+        if (!isNaN(num)) minCompetitorRows = num;
+      }
+    });
+  }
+
+  // map targetSet to numeric N
+  const mapTop = { 'top50':50, 'top75':75, 'top100':100, 'full': 99999 };
+  const topN = mapTop[targetSet] || 75;
+
+  
+  // --- 2) Choose source sheet for market rows
+  const sourceNames = ['Cluster_Trimmed','Clustered_Data','Outlier_Trimmed','Trimmed_Data','Raw_Data'];
+  let source = null, sourceName = '';
+  for (const n of sourceNames) {
+    const s = ss.getSheetByName(n);
+    if (s) { source = s; sourceName = n; break; }
+  }
+  if (!source) { SpreadsheetApp.getUi().alert('No market source sheet found (Cluster_Trimmed/Outlier_Trimmed/Trimmed_Data/Raw_Data).'); return; }
+  const sVals = source.getDataRange().getValues();
+  const sHdr = sVals[0].map(h=>h.toString().trim());
+  const sRows = sVals.slice(1);
+  const idxPrice = sHdr.indexOf('Price');
+  const idxProd = sHdr.indexOf('Product Name') !== -1 ? sHdr.indexOf('Product Name') : (sHdr.indexOf('Product') !== -1 ? sHdr.indexOf('Product') : 0);
+  const idxBrand = sHdr.indexOf('Brand');
+  const idxPos = sHdr.indexOf('Position');
+
+  // --- 3) Filter rows by include/exclude/category and remove own brand rows
+  const matches = sRows.filter(r=>{
+    const title = (r[idxProd]||'').toString().toLowerCase();
+    const b = (r[idxBrand]||'').toString().trim();
+    const price = Number(r[idxPrice]) || 0;
+    if (price <= 0) return false;
+    if (brandName && b && b.toLowerCase() === brandName.toLowerCase()) return false;
+    if (includeTerms.length) {
+      const ok = includeTerms.some(t => title.indexOf(t) !== -1);
+      if (!ok) return false;
+    }
+    if (excludeTerms.length) {
+      for (const ex of excludeTerms) if (title.indexOf(ex) !== -1) return false;
+    }
+    if (categoryFilter.length) {
+      const okCat = categoryFilter.some(c => title.indexOf(c) !== -1);
+      if (!okCat) return false;
+    }
+    return true;
+  });
+
+  if (matches.length === 0) { SpreadsheetApp.getUi().alert('No competitor rows found after filtering. Adjust include/exclude terms or source data.'); return; }
+
+  // sort by position if present
+  if (idxPos !== -1) matches.sort((a,b)=>(parseFloat(a[idxPos])||99999)-(parseFloat(b[idxPos])||99999));
+
+  // take top N based on targetSet
+  const topMatches = matches.slice(0, topN);
+
+  const compPrices = topMatches.map(r=>Number(r[idxPrice])||0).filter(v=>v>0);
+  const competitorMedian = compPrices.length ? median(compPrices) : 0;
+
+  // --- Validation: sample counts
+  const totalMatches = matches.length;            // total rows that passed filters
+  const usedMatches = topMatches.length;          // rows used (Top N)
+  const percentUsed = totalMatches ? (usedMatches / totalMatches) * 100 : 0;
+  const sampleWarning = (usedMatches < minCompetitorRows) ? `WARNING: only ${usedMatches} competitor rows used (min ${minCompetitorRows})` : '';
+// --- 4) Determine tier medians (dynamic or global)
+let tierMedians = {};
+let tierNames = [];
+let usingDynamic = false;
+
+// read control flag
+let useDynamicTiers = false;
+if (control) {
+  const cvals = control.getDataRange().getValues();
+  cvals.forEach(r => {
+    if ((r[0] || '').toString().trim().toLowerCase() === 'use_dynamic_tiers') {
+      const val = (r[1] || '').toString().trim().toLowerCase();
+      useDynamicTiers = (val === 'true' || val === 'yes');
+    }
+  });
+}
+
+// if dynamic → rebuild medians from filtered competitor set
+if (useDynamicTiers) {
+  usingDynamic = true;
+  tierMedians = buildDynamicTierMedians(matches, sHdr);
+  tierNames = Object.keys(tierMedians);
+  if (tierNames.length === 0) {
+    SpreadsheetApp.getUi().alert('⚠️ Dynamic tier build failed — falling back to global Brand_Aggregation.');
+    usingDynamic = false;
+  }
+}
+
+// fallback → use global Brand_Aggregation
+if (!usingDynamic) {
+  const brandAgg = ss.getSheetByName('Brand_Aggregation');
+  if (!brandAgg) { SpreadsheetApp.getUi().alert('Brand_Aggregation missing. Run Brand Aggregation first.'); return; }
+  const aggVals = brandAgg.getDataRange().getValues();
+  const aggHdr = aggVals[0].map(h=>h.toString().trim());
+  const aggRows = aggVals.slice(1);
+  const idxAggTier = aggHdr.indexOf('Brand_Tier');
+  const idxAggMed = aggHdr.indexOf('median_price');
+  if (idxAggTier === -1 || idxAggMed === -1) { SpreadsheetApp.getUi().alert('Brand_Aggregation missing Brand_Tier or median_price.'); return; }
+
+  const tierGroups = {};
+  aggRows.forEach(r=>{
+    const t = (r[idxAggTier] || '').toString().trim();
+    const p = Number(r[idxAggMed]) || 0;
+    if (!t) return;
+    if (!tierGroups[t]) tierGroups[t] = [];
+    if (p > 0) tierGroups[t].push(p);
+  });
+  Object.keys(tierGroups).forEach(t => tierMedians[t] = median(tierGroups[t]));
+  tierNames = Object.keys(tierMedians);
+}
+
+  // --- 6) Determine anchor tier & median
+  let anchorTier = '';
+  let anchorTierMedian = 0;
+  if (intendedTier && intendedTier.toLowerCase() !== 'auto') {
+    const key = Object.keys(tierMedians).find(k => k.toLowerCase() === intendedTier.toLowerCase());
+    if (key) {
+      anchorTier = key;
+      anchorTierMedian = tierMedians[key];
+    } else {
+      // fallback to auto detection if intended tier unknown
+      let bestDiff = Infinity;
+      Object.keys(tierMedians).forEach(t => {
+        const m = tierMedians[t];
+        const d = Math.abs(competitorMedian - m);
+        if (d < bestDiff) { bestDiff = d; anchorTier = t; anchorTierMedian = m; }
+      });
+    }
+  } else {
+    // Auto-select by competitor median
+    if (competitorMedian > 0) {
+      let bestDiff = Infinity;
+      Object.keys(tierMedians).forEach(t => {
+        const m = tierMedians[t];
+        const d = Math.abs(competitorMedian - m);
+        if (d < bestDiff) { bestDiff = d; anchorTier = t; anchorTierMedian = m; }
+      });
+    } else {
+      const allMeds = Object.values(tierMedians);
+      anchorTierMedian = median(allMeds);
+      anchorTier = Object.keys(tierMedians)[0] || 'Unknown';
+    }
+  }
+
+  // --- 7) Compute Tier mismatch and risk (if user provided intended tier)
+  let tierMatchFlag = 'Auto';
+  let tierMismatchPct = 0;
+  let riskFlag = '';
+  const intendedKey = Object.keys(tierMedians).find(k => k.toLowerCase() === intendedTier.toLowerCase());
+  if (intendedTier && intendedTier.toLowerCase() !== 'auto' && intendedKey) {
+    tierMatchFlag = (intendedKey === anchorTier) ? 'Match' : 'Mismatch';
+    const intendedMedian = tierMedians[intendedKey] || 0;
+    if (intendedMedian > 0) {
+      tierMismatchPct = Math.abs(anchorTierMedian - intendedMedian) / intendedMedian * 100;
+      if (tierMismatchPct > tierMismatchThreshold) riskFlag = 'High Risk';
+    } else {
+      tierMismatchPct = 0;
+    }
+  } else if (intendedTier && intendedTier.toLowerCase() !== 'auto' && !intendedKey) {
+    tierMatchFlag = 'IntendedTierUnknown';
+  }
+
+  // --- 8) Strategy modifier and recommendation band
+  const modifiers = { 'undercut': -0.10, 'align': 0.00, 'premium': 0.12, 'value': -0.15 };
+  const mod = (modifiers[strategy] !== undefined) ? modifiers[strategy] : 0.0;
+  const rawAnchor = anchorTierMedian || competitorMedian || 0;
+  let strategyAdjusted = rawAnchor * (1 + mod);
+  const suggestedLow = Math.max(breakEven, strategyAdjusted * (1 - bandPct));
+  const suggestedHigh = Math.max(breakEven, strategyAdjusted * (1 + bandPct));
+  const finalReco = Math.max(breakEven, (suggestedLow + suggestedHigh) / 2);
+  const deltaVsComp = competitorMedian ? ((finalReco - competitorMedian) / competitorMedian) * 100 : 0;
+
+  // --- 9) Write result (append a new row to Price_Recommendation)
+  const out = ss.getSheetByName('Price_Recommendation') || ss.insertSheet('Price_Recommendation');
+  const outHdr = [
+    'Run_TS','Product','Brand','Intended_Tier','Anchor_Tier','Tier_Match_Flag','Tier_Mismatch_Pct','Risk_Flag',
+    'Strategy','Target_Set','Include_Terms','Exclude_Terms',
+    'Tier_Median','Competitor_Median','Raw_Anchor','Strategy_Modifier',
+    'Suggested_Low','Suggested_High','Final_Recommend','Break_Even','Delta_vs_Competitor',
+    'Total_Matches','Used_Matches','Percent_Used','Competitor_Sample_Warning','Notes','Source_Sheet'
+  ];
+  // If sheet empty, write header
+  if (out.getLastRow() === 0) out.getRange(1,1,1,outHdr.length).setValues([outHdr]);
+
+  const tierSource = usingDynamic ? 'Dynamic (Filtered Set)' : 'Global (Brand_Aggregation)';
+  const note = `Anchor used: ${anchorTier} median; usedMatches:${usedMatches}/${totalMatches}; ${sampleWarning ? sampleWarning : ''}`;
+  const writeRow = [
+    new Date(),
+    productName,
+    brandName || '',
+    intendedTier,
+    anchorTier,
+    tierMatchFlag,
+    Number(tierMismatchPct.toFixed(1)) + '%',
+    riskFlag,
+    strategy,
+    targetSet,
+    includeTerms.join(', '),
+    excludeTerms.join(', '),
+    Number(anchorTierMedian.toFixed(2)),
+    Number(competitorMedian.toFixed(2)),
+    Number(rawAnchor.toFixed(2)),
+    Number(mod.toFixed(3)),
+    Number(suggestedLow.toFixed(2)),
+    Number(suggestedHigh.toFixed(2)),
+    Number(finalReco.toFixed(2)),
+    Number(breakEven.toFixed(2)),
+    Number(deltaVsComp.toFixed(1)) + '%',
+    totalMatches,
+    usedMatches,
+    Number(percentUsed.toFixed(1)) + '%',
+    sampleWarning,
+    note,
+    sourceName
+  ];
+  out.appendRow(writeRow);
+  out.autoResizeColumns(1, outHdr.length);
+
+  // Log & UI
+  logs.appendRow([new Date(), 'recommendNewProductPrice', `Product:${productName} Strategy:${strategy} Final:${finalReco}`, 'OK']);
+  SpreadsheetApp.getUi().alert(`✅ Recommendation complete — final price: ${finalReco.toFixed(2)} ${currency || ''}\nSee sheet: Price_Recommendation`);
+}
+
+/* helper median reused */
+function median(arr){
+  if (!arr || arr.length === 0) return 0;
+  const s = arr.slice().sort((a,b)=>a-b);
+  const mid = Math.floor(s.length/2);
+  return s.length % 2 === 0 ? (s[mid-1] + s[mid]) / 2 : s[mid];
+}
+/**
+ * Orchestrator: runFullPriceWorkflow()
+ * - Runs the full pipeline in order, with safe error handling and logging.
+ * - Respects toggles in the Control sheet (run_transform, run_dq, run_trim, run_cluster,
+ *   run_brand_agg, run_ccs, run_brand_ccs, run_reconcile, run_validate, run_recommend, hide_intermediate).
+ *
+ * Note: this calls your existing module functions if they exist. If a function is missing
+ * it logs and continues.
+ */
+function runFullPriceWorkflow() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+  const control = ss.getSheetByName('Control');
+
+  // Default toggles (can be overridden in Control)
+  const toggles = {
+    run_transform: true,
+    run_dq: true,
+    run_trim: true,
+    run_cluster: true,
+    run_brand_agg: true,
+    run_ccs: true,
+    run_brand_ccs: true,
+    run_reconcile: true,
+    run_validate: true,
+    run_recommend: true,
+    hide_intermediate: true
+  };
+
+  // Read control sheet to override toggles (case-insensitive)
+  if (control) {
+    const cvals = control.getDataRange().getValues();
+    cvals.forEach(r => {
+      const k = (r[0] || '').toString().trim().toLowerCase();
+      const v = (r[1] === undefined ? '' : r[1]).toString().trim().toLowerCase();
+      if (!k) return;
+      if (k in toggles) {
+        toggles[k] = (v === 'true' || v === 'yes' || v === '1');
+      }
+    });
+  }
+
+  const runId = new Date().toISOString();
+  const summary = { runId, steps: [] };
+  const stepLog = (name, status, note) => {
+    summary.steps.push({ name, status, note: note || '' });
+    logs.appendRow([new Date(), runId, name, status, note || '']);
+  };
+
+  // small helper to call a function by name if present
+  function safeCall(fnName) {
+    try {
+      const fn = this[fnName];
+      if (typeof fn !== 'function') {
+        stepLog(fnName, 'SKIPPED', 'Function not found');
+        return { ok: false, skipped: true };
+      }
+      stepLog(fnName, 'STARTED', '');
+      fn(); // call module
+      stepLog(fnName, 'OK', '');
+      return { ok: true };
+    } catch (e) {
+      const msg = (e && e.message) ? e.message : String(e);
+      stepLog(fnName, 'ERROR', msg);
+      return { ok: false, error: msg };
+    }
+  }
+
+  // -------------- Run Steps in Order --------------
+  try {
+    // 1) transformDataDump
+    if (toggles.run_transform) safeCall('transformDataDump');
+
+    // 2) runDataQualityCheck
+    if (toggles.run_dq) safeCall('runDataQualityCheck');
+
+    // 3) runOutlierTrim
+    if (toggles.run_trim) safeCall('runOutlierTrim');
+
+    // 4) runClusterSegmentation
+    if (toggles.run_cluster) safeCall('runClusterSegmentation');
+
+    // 5) runBrandAggregation (may be named runBrandAggregation or similar)
+    if (toggles.run_brand_agg) {
+      // try common variants
+      const tried = ['runBrandAggregation','runBrand_Aggregation','run_brand_aggregation'];
+      let done=false;
+      for (const t of tried) {
+        const res = safeCall(t);
+        if (res.ok) { done=true; break; }
+      }
+      if (!done) stepLog('runBrandAggregation', 'SKIPPED', 'No matching function name found');
+    }
+
+    // 6) computeCCS_v2 (or computeCCS)
+    if (toggles.run_ccs) {
+      const tried = ['computeCCS_v2','computeCCS','compute_ccs_v2'];
+      let done=false;
+      for (const t of tried) {
+        const res = safeCall(t);
+        if (res.ok) { done=true; break; }
+      }
+      if (!done) stepLog('computeCCS', 'SKIPPED', 'No matching function name found');
+    }
+
+    // 7) computeBrandCCS (brand-level CCS merge)
+    if (toggles.run_brand_ccs) safeCall('computeBrandCCS');
+
+    // 8) reconcileBrandTier_priceFirst (tier reconcile)
+    if (toggles.run_reconcile) {
+      const tried = ['reconcileBrandTier_priceFirst','reconcileBrandTier','reconcile_brand_tier'];
+      let done=false;
+      for (const t of tried) {
+        const res = safeCall(t);
+        if (res.ok) { done=true; break; }
+      }
+      if (!done) stepLog('reconcileBrandTier', 'SKIPPED', 'No matching function name found');
+    }
+
+    // 9) validateS2CPrices
+    if (toggles.run_validate) safeCall('validateS2CPrices');
+
+    // 10) recommendNewProductPrice
+    if (toggles.run_recommend) safeCall('recommendNewProductPrice');
+
+    // All steps done
+    stepLog('Orchestrator', 'COMPLETE', `Run ${runId} finished. Steps: ${summary.steps.length}`);
+
+    // Optionally hide intermediate helper sheets
+    if (toggles.hide_intermediate) {
+      try {
+        hideHelperSheets();
+        stepLog('hideHelperSheets','OK','Helper sheets hidden');
+      } catch (e) {
+        stepLog('hideHelperSheets','ERROR', e.message || String(e));
+      }
+    }
+
+    // Final UI summary
+    SpreadsheetApp.getUi().alert('✅ Full workflow complete — check Price_Recommendation and Logs for details.');
+
+  } catch (e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    stepLog('Orchestrator','FATAL', msg);
+    SpreadsheetApp.getUi().alert('❌ Workflow failed. See Logs for details.');
+  }
+}
+
+/** Hide a set of known helper sheets (keeps data_dump, Control, Pricing_Input, Price_Recommendation, Logs visible) */
+function hideHelperSheets() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const keep = ['data_dump','control','pricing_input','price_recommendation','logs','brand_aggregation','s2c_validation'];
+  // normalize to lowercase
+  const keepLower = keep.map(s=>s.toString().toLowerCase());
+  const allSheets = ss.getSheets();
+  allSheets.forEach(sh => {
+    const name = sh.getName();
+    const low = name.toString().toLowerCase();
+    // do not hide the UI-critical sheets or user's data_dump
+    if (keepLower.indexOf(low) === -1) {
+      try { sh.hideSheet(); } catch(e) { /* ignore */ }
+    } else {
+      try { sh.showSheet(); } catch(e) { /* ignore */ }
+    }
+  });
+}
+
+/** Unhide all hidden sheets (exposed on the main menu) */
+function unhideAllSheets() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.getSheets().forEach(sh => {
+    try { sh.showSheet(); } catch(e) {}
+  });
+  SpreadsheetApp.getUi().alert('All sheets are now visible.');
+}
+
+/** Show Logs (open Logs sheet and select top) */
+function showLogs() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const logs = ss.getSheetByName('Logs') || ss.insertSheet('Logs');
+  ss.setActiveSheet(logs);
+  SpreadsheetApp.getUi().alert('Logs opened. Review latest entries in the Logs sheet.');
+}
+/**
+ * generatePriceCCSVisuals()
+ * - Builds a Dashboard sheet with: Price histogram, CCS histogram, Scatter (Price vs CCS)
+ * - Reads latest Price_Recommendation row to get Anchor_Tier and S2C final recommended price
+ * - Uses Brand_Aggregation to get brand-level median_price and avg_CCS (or median_CCS/weighted_CCS fallback)
+ */
+function generatePriceCCSVisuals() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const pr = ss.getSheetByName('Price_Recommendation');
+  if (!pr) { SpreadsheetApp.getUi().alert('Price_Recommendation sheet missing. Run recommendation first.'); return; }
+  const prVals = pr.getDataRange().getValues();
+  if (prVals.length < 2) { SpreadsheetApp.getUi().alert('No recommendation rows found.'); return; }
+
+  // Get last (most recent) recommendation row
+  const headers = prVals[0].map(h => h.toString().trim());
+  const lastRow = prVals[prVals.length - 1];
+  const get = (name) => {
+    const idx = headers.indexOf(name);
+    return idx === -1 ? '' : lastRow[idx];
+  };
+
+  const anchorTier = (get('Anchor_Tier') || '').toString().trim();
+  const s2cFinalPrice = Number(get('Final_Recommend')) || 0;
+  const s2cBrand = (get('Brand') || '').toString().trim();
+  const includeTerms = (get('Include_Terms') || '').toString();
+  const targetSet = (get('Target_Set') || '').toString();
+
+  if (!anchorTier) {
+    SpreadsheetApp.getUi().alert('Anchor_Tier not found in latest recommendation row.');
+    return;
+  }
+
+  // Load Brand_Aggregation
+  const brandAgg = ss.getSheetByName('Brand_Aggregation');
+  if (!brandAgg) { SpreadsheetApp.getUi().alert('Brand_Aggregation missing.'); return; }
+  const aggVals = brandAgg.getDataRange().getValues();
+  const aggHdr = aggVals[0].map(h => h.toString().trim());
+  const aggRows = aggVals.slice(1);
+
+  const idxBrand = aggHdr.indexOf('Brand');
+  const idxMedianPrice = aggHdr.indexOf('median_price');
+  // try avg_CCS then median_CCS then weighted_CCS
+  const idxAvgCCS = aggHdr.indexOf('avg_CCS');
+  const idxMedianCCS = aggHdr.indexOf('median_CCS');
+  const idxWeightedCCS = aggHdr.indexOf('weighted_CCS');
+
+  if (idxBrand === -1 || idxMedianPrice === -1) {
+    SpreadsheetApp.getUi().alert('Brand_Aggregation must contain Brand and median_price columns.');
+    return;
+  }
+
+  // collect brands in chosen tier
+  const tierBrands = [];
+  aggRows.forEach(r => {
+    const tier = (r[aggHdr.indexOf('Brand_Tier')] || '').toString().trim();
+    if (tier === anchorTier) {
+      const b = (r[idxBrand] || '').toString().trim();
+      const p = Number(r[idxMedianPrice]) || 0;
+      let ccs = 0;
+      if (idxAvgCCS !== -1) ccs = Number(r[idxAvgCCS]) || 0;
+      else if (idxMedianCCS !== -1) ccs = Number(r[idxMedianCCS]) || 0;
+      else if (idxWeightedCCS !== -1) ccs = Number(r[idxWeightedCCS]) || 0;
+      tierBrands.push({ brand: b, median_price: p, ccs: ccs });
+    }
+  });
+
+  if (tierBrands.length === 0) {
+    SpreadsheetApp.getUi().alert(`No brands found in tier "${anchorTier}". Cannot build visuals.`);
+    return;
+  }
+
+  // Compute S2C CCS proxy: average CCS of competitive set (approx)
+  // We will try to extract Competitor_Median or average CCS from latest recommendation row
+  let s2cCCSproxy = null;
+  const idxCompetitorMedian = headers.indexOf('Competitor_Median');
+  if (idxCompetitorMedian !== -1) {
+    // no direct CCS here, but approximate later via brand averages — use mean CCS of tier brands
+    s2cCCSproxy = tierBrands.map(x => x.ccs || 0).filter(v=>v>0);
+    s2cCCSproxy = s2cCCSproxy.length ? (s2cCCSproxy.reduce((a,b)=>a+b,0)/s2cCCSproxy.length) : 0;
+  } else {
+    s2cCCSproxy = tierBrands.map(x => x.ccs || 0).filter(v=>v>0);
+    s2cCCSproxy = s2cCCSproxy.length ? (s2cCCSproxy.reduce((a,b)=>a+b,0)/s2cCCSproxy.length) : 0;
+  }
+
+  // Build dashboard sheet and write data
+  const dashName = 'Dashboard';
+  let dash = ss.getSheetByName(dashName);
+  if (dash) ss.deleteSheet(dash);
+  dash = ss.insertSheet(dashName, 0);
+
+  // Header
+  dash.getRange(1,1,1,6).setValues([['Brand','Median_Price','CCS','S2C_Label','S2C_Price','S2C_CCS']]);
+
+  // Write brand rows and include S2C as extra row at end for scatter dataset
+  const rowsOut = [];
+  tierBrands.forEach(b => {
+    rowsOut.push([b.brand, b.median_price, b.ccs || 0, '', '', '']);
+  });
+  // S2C row (label it so we can style in chart later)
+  const s2cLabel = s2cBrand ? `S2C: ${s2cBrand}` : 'S2C (Recommended)';
+  rowsOut.push([s2cLabel, s2cFinalPrice || 0, s2cCCSproxy || 0, 'S2C', s2cFinalPrice || 0, s2cCCSproxy || 0]);
+
+  if (rowsOut.length === 0) {
+    SpreadsheetApp.getUi().alert('No data to write to Dashboard.');
+    return;
+  }
+  dash.getRange(2,1,rowsOut.length, rowsOut[0].length).setValues(rowsOut);
+  dash.autoResizeColumns(1,6);
+
+  // Create charts using Sheets embedded charts
+  // 1) Price histogram (Brands median_price)
+  const lastRowIndex = 1 + rowsOut.length;
+  // Range for median prices (exclude header): B2:B[lastRowIndex]
+  const priceRange = dash.getRange(2,2,rowsOut.length,1);
+  const hist1 = dash.newChart()
+    .asHistogramChart()
+    .addRange(priceRange)
+    .setOption('title', `${anchorTier} — Brand Median Price Distribution`)
+    .setOption('legend', { position: 'none' })
+    .setPosition(1,8,0,0)
+    .build();
+  dash.insertChart(hist1);
+
+  // 2) CCS histogram (Brands ccs)
+  const ccsRange = dash.getRange(2,3,rowsOut.length,1);
+  const hist2 = dash.newChart()
+    .asHistogramChart()
+    .addRange(ccsRange)
+    .setOption('title', `${anchorTier} — CCS Distribution`)
+    .setOption('legend', { position: 'none' })
+    .setPosition(18,8,0,0)
+    .build();
+  dash.insertChart(hist2);
+
+  // 3) Scatter: Median_Price (x) vs CCS (y). Use columns B and C
+  // We'll include S2C point as the last row (it will show as a point)
+  const scatterRange = dash.getRange(2,2,rowsOut.length,2); // B2:C...
+  const scatter = dash.newChart()
+    .asScatterChart()
+    .addRange(scatterRange)
+    .setOption('title', `${anchorTier} — CCS vs Brand Median Price`)
+    .setOption('hAxis', { title: 'Median Price' })
+    .setOption('vAxis', { title: 'Avg CCS' })
+    .setOption('legend', { position: 'right' })
+    .setPosition(35,2,0,0)
+    .build();
+  dash.insertChart(scatter);
+
+  // Freeze header and select dashboard
+  dash.setFrozenRows(1);
+  ss.setActiveSheet(dash);
+
+  SpreadsheetApp.getUi().alert('Dashboard created with 3 visuals (Price histogram, CCS histogram, Scatter).');
+}
+
+/* median helper reused */
+function median(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const s = arr.slice().sort((a,b)=>a-b);
+  const m = Math.floor(s.length/2);
+  return s.length % 2 === 0 ? (s[m-1] + s[m]) / 2 : s[m];
+}
+
+/**
+ * generatePriceCCSVisuals_v2() — corrected chart builder (uses setChartType)
+ * - Bubble chart: x = median_price, y = CCS, size = n_listings
+ * - Competitive brands = blue series, S2C = red series (single-point series)
+ * - Writes Dashboard sheet (overwrites existing)
+ */
+function generatePriceCCSVisuals_v2() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const pr = ss.getSheetByName('Price_Recommendation');
+  if (!pr) { SpreadsheetApp.getUi().alert('Price_Recommendation sheet missing. Run recommendation first.'); return; }
+  const prVals = pr.getDataRange().getValues();
+  if (prVals.length < 2) { SpreadsheetApp.getUi().alert('No recommendation rows found.'); return; }
+
+  // last recommendation row
+  const prHdr = prVals[0].map(h => h.toString().trim());
+  const lastRow = prVals[prVals.length - 1];
+  const getPR = (name) => {
+    const idx = prHdr.indexOf(name);
+    return idx === -1 ? '' : lastRow[idx];
+  };
+
+  const anchorTier = (getPR('Anchor_Tier') || '').toString().trim();
+  const s2cFinalPrice = Number(getPR('Final_Recommend')) || 0;
+  const s2cBrand = (getPR('Brand') || '').toString().trim();
+
+  if (!anchorTier) {
+    SpreadsheetApp.getUi().alert('Anchor_Tier not found in latest recommendation row.');
+    return;
+  }
+
+  // load Brand_Aggregation
+  const brandAgg = ss.getSheetByName('Brand_Aggregation');
+  if (!brandAgg) { SpreadsheetApp.getUi().alert('Brand_Aggregation missing.'); return; }
+  const aggVals = brandAgg.getDataRange().getValues();
+  if (aggVals.length < 2) { SpreadsheetApp.getUi().alert('Brand_Aggregation is empty.'); return; }
+  const aggHdr = aggVals[0].map(h => h.toString().trim());
+  const aggRows = aggVals.slice(1);
+
+  const idxBrand = aggHdr.indexOf('Brand');
+  const idxMedianPrice = aggHdr.indexOf('median_price');
+  const idxAvgCCS = aggHdr.indexOf('avg_CCS');
+  const idxMedianCCS = aggHdr.indexOf('median_CCS');
+  const idxWeightedCCS = aggHdr.indexOf('weighted_CCS');
+  const idxN = aggHdr.indexOf('n_listings');
+  const idxBrandTier = aggHdr.indexOf('Brand_Tier');
+
+  if (idxBrand === -1 || idxMedianPrice === -1 || idxBrandTier === -1) {
+    SpreadsheetApp.getUi().alert('Brand_Aggregation must contain Brand, Brand_Tier and median_price columns.');
+    return;
+  }
+
+  // gather tier brands (only those with numeric price & listing count)
+  const tierBrands = [];
+  aggRows.forEach(r => {
+    const tier = (r[idxBrandTier] || '').toString().trim();
+    if (tier !== anchorTier) return;
+    const brand = (r[idxBrand] || '').toString().trim();
+    const price = Number(r[idxMedianPrice]) || 0;
+    let ccs = 0;
+    if (idxAvgCCS !== -1) ccs = Number(r[idxAvgCCS]) || 0;
+    else if (idxMedianCCS !== -1) ccs = Number(r[idxMedianCCS]) || 0;
+    else if (idxWeightedCCS !== -1) ccs = Number(r[idxWeightedCCS]) || 0;
+    const nlist = (idxN !== -1) ? (Number(r[idxN]) || 0) : 1;
+    if (price > 0) tierBrands.push({ brand, price, ccs, nlist });
+  });
+
+  if (tierBrands.length === 0) {
+    SpreadsheetApp.getUi().alert(`No brands found in tier "${anchorTier}". Cannot build visuals.`);
+    return;
+  }
+
+  // compute S2C CCS proxy = avg CCS of tierBrands (if S2C specific CCS not present)
+  const ccsVals = tierBrands.map(b => b.ccs || 0).filter(v => v > 0);
+  const s2cCCSproxy = ccsVals.length ? (ccsVals.reduce((a,b)=>a+b,0)/ccsVals.length) : 0;
+
+  // prepare Dashboard sheet
+  const dashName = 'Dashboard';
+  let dash = ss.getSheetByName(dashName);
+  if (dash) ss.deleteSheet(dash);
+  dash = ss.insertSheet(dashName, 0);
+
+  // write header: Brand, Median_Price, CCS, N_Listings, IsS2C
+  dash.getRange(1,1,1,5).setValues([['Brand','Median_Price','CCS','N_Listings','IsS2C']]);
+
+  const rowsOut = [];
+  tierBrands.forEach(b => {
+    rowsOut.push([b.brand, Number(b.price), Number(b.ccs || 0), Number(b.nlist || 0), '']);
+  });
+
+  // S2C row: labelled and marked IsS2C
+  const s2cLabel = s2cBrand ? `S2C: ${s2cBrand}` : 'S2C (Recommended)';
+  rowsOut.push([s2cLabel, Number(s2cFinalPrice), Number(s2cCCSproxy), 1, 'S2C']);
+
+  dash.getRange(2,1,rowsOut.length,rowsOut[0].length).setValues(rowsOut);
+  dash.autoResizeColumns(1,5);
+  dash.setFrozenRows(1);
+
+  // Build bubble chart:
+  // - Series 0 (competitors): B2:D(compCount)
+  // - Series 1 (S2C): single row
+  const compCount = rowsOut.filter(r => r[4] !== 'S2C').length;
+  const compRange = dash.getRange(2,2,compCount,3); // Median_Price, CCS, N_Listings
+  const s2cRange = dash.getRange(2 + compCount, 2, 1, 3);
+
+  // create bubble chart with two series using correct API
+  const chartBuilder = dash.newChart()
+    .setChartType(Charts.ChartType.BUBBLE)
+    .addRange(compRange)
+    .addRange(s2cRange)
+    .setPosition(2,7,0,0)
+    .setOption('title', `${anchorTier} — CCS vs Brand Median Price (bubble=size=n_listings)`)
+    .setOption('hAxis', { title: 'Median Price' })
+    .setOption('vAxis', { title: 'Avg CCS' })
+    .setOption('legend', { position: 'right' })
+    .setOption('colors', ['#2b6dc1', '#d93025'])
+    .setOption('bubble', { textStyle: { fontSize: 10 } });
+
+  dash.insertChart(chartBuilder.build());
+
+  // Add KPIs
+  const avgPrice = median(tierBrands.map(b=>b.price));
+  const avgCCS = ccsVals.length ? (ccsVals.reduce((a,b)=>a+b,0)/ccsVals.length) : 0;
+  dash.getRange(1,7,4,2).setValues([
+    ['Tier', anchorTier],
+    ['Brands in Tier', compCount],
+    ['Tier Median Price', Number(avgPrice.toFixed(2))],
+    ['Tier Avg CCS', Number(avgCCS.toFixed(3))]
+  ]);
+
+  ss.setActiveSheet(dash);
+  SpreadsheetApp.getUi().alert('Dashboard created: bubble chart (price vs CCS), S2C highlighted in red.');
+}
+
+/* median helper */
+function median(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const s = arr.slice().sort((a,b)=>a-b);
+  const m = Math.floor(s.length/2);
+  return s.length % 2 === 0 ? (s[m-1] + s[m]) / 2 : s[m];
+}
+
+/**
+ * getBaseDataSheet() — picks the latest valid dataset in this order:
+ * Outlier_Trimmed → Trimmed_Filtered → Cluster_Trimmed → Trimmed_Data → Raw_Data
+ */
+function getBaseDataSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const order = ['Outlier_Trimmed', 'Trimmed_Filtered', 'Cluster_Trimmed', 'Trimmed_Data', 'Raw_Data'];
+  for (let i = 0; i < order.length; i++) {
+    const sh = ss.getSheetByName(order[i]);
+    if (sh && sh.getLastRow() > 1) return sh;
+  }
+  return null;
+}

@@ -1,0 +1,270 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 # app.py\
+import streamlit as st\
+import pandas as pd\
+import re\
+from io import BytesIO\
+from datetime import date\
+\
+st.set_page_config(page_title="S2C PPC Bulk Generator", layout="wide")\
+\
+# ---------- helpers ----------\
+def short_ag(s):\
+    return re.sub(r'[^A-Za-z0-9_]', '_', (s or ""))[:30]\
+\
+def make_unique_campaigns(df):\
+    df = df.copy()\
+    df['Ad Group Safe'] = df.get('Ad Group', '').astype(str).apply(short_ag)\
+    df['Campaign'] = df.apply(lambda r: f"\{r.get('Campaign','')\}_\{r['Ad Group Safe']\}", axis=1)\
+    df = df.drop(columns=['Ad Group Safe'])\
+    return df\
+\
+def df_to_bytes(df):\
+    b = BytesIO()\
+    df.to_csv(b, index=False, encoding='utf-8')\
+    b.seek(0)\
+    return b\
+\
+def validate_inputs(prod_df, cere_df):\
+    errs = []\
+    req_prod = \{"SKU","ASIN","Title","Brand"\}\
+    if not req_prod.issubset(set(prod_df.columns)):\
+        errs.append(f"products_master missing: \{req_prod - set(prod_df.columns)\}")\
+    if not \{'Keyword'\}.issubset(set(cere_df.columns)):\
+        errs.append("cerebro_keywords must include at least: Keyword")\
+    return errs\
+\
+# ---------- UI ----------\
+st.title("S2C PPC Bulk Generator \'97 Fast")\
+\
+left, right = st.columns([1,2])\
+\
+with left:\
+    st.subheader("Inputs")\
+    prod_file = st.file_uploader("Upload products_master.csv", type=["csv"], key="prod")\
+    cere_file = st.file_uploader("Upload cerebro_keywords.csv", type=["csv"], key="cere")\
+    st.markdown("---")\
+    st.subheader("Toggles & Defaults")\
+    col1, col2 = st.columns(2)\
+    with col1:\
+        enable_auto = st.checkbox("Auto", value=True)\
+        enable_manual = st.checkbox("Manual", value=True)\
+        enable_pt = st.checkbox("Product Targeting", value=True)\
+        enable_neg = st.checkbox("Negatives", value=True)\
+    with col2:\
+        budget_auto = st.number_input("Budget Auto", value=20.0, step=1.0)\
+        budget_manual = st.number_input("Budget Manual", value=50.0, step=1.0)\
+        budget_pt = st.number_input("Budget PT", value=30.0, step=1.0)\
+    st.markdown("**Bids**")\
+    bid_auto = st.number_input("Bid Auto", value=0.6, step=0.1)\
+    bid_exact = st.number_input("Bid Exact", value=1.5, step=0.1)\
+    bid_phrase = st.number_input("Bid Phrase", value=1.0, step=0.1)\
+    bid_broad = st.number_input("Bid Broad", value=0.5, step=0.1)\
+    top_k = st.number_input("Top K competitor keywords per SKU", value=10, min_value=1, step=1)\
+    st.markdown("---")\
+    operator = st.text_input("Operator name (run_log)", value="Faisal")\
+    generate_btn = st.button("Generate PPC Files")\
+\
+with right:\
+    status = st.empty()\
+    preview = st.empty()\
+    neg_preview = st.empty()\
+    dl = st.empty()\
+    log = st.empty()\
+\
+# ---------- Action ----------\
+if generate_btn:\
+    if prod_file is None or cere_file is None:\
+        status.error("Upload both products_master.csv and cerebro_keywords.csv.")\
+    else:\
+        try:\
+            prod_df = pd.read_csv(prod_file, dtype=str).fillna("")\
+            cere_df = pd.read_csv(cere_file, dtype=str).fillna("")\
+        except Exception as e:\
+            status.error(f"Failed to read CSVs: \{e\}")\
+            st.stop()\
+\
+        errs = validate_inputs(prod_df, cere_df)\
+        if errs:\
+            status.error("Validation: " + " | ".join(errs))\
+            st.stop()\
+\
+        status.success("Inputs OK \'97 generating CSVs.")\
+\
+        rows = []\
+        negs = []\
+        today = date.today().isoformat()\
+\
+        # iterate products\
+        for _, p in prod_df.iterrows():\
+            sku = p.get("SKU","").strip()\
+            asin = p.get("ASIN","").strip()\
+            title = p.get("Title","").strip()\
+            brand = p.get("Brand","").strip() or "S2C"\
+            default_bid = float(p.get("DefaultBid") or bid_exact)\
+\
+            # Auto\
+            if enable_auto:\
+                rows.append(\{\
+                    "Campaign Type":"Auto",\
+                    "Campaign":f"\{brand\}_\{sku\}_Auto",\
+                    "Campaign Daily Budget": budget_auto,\
+                    "Campaign Start Date": today,\
+                    "Campaign End Date":"",\
+                    "Campaign Targeting Type":"Auto",\
+                    "Campaign Strategy":"Legacy",\
+                    "Ad Group":f"Auto_\{sku\}",\
+                    "Max Bid": bid_auto,\
+                    "Keyword/ASIN":"",\
+                    "Match Type":"",\
+                    "SKU":sku,\
+                    "State":"enabled",\
+                    "Placement":"",\
+                    "Custom Label 1":"",\
+                    "Source":"user",\
+                    "Notes":"auto harvest"\
+                \})\
+\
+            # Manual seed\
+            if enable_manual:\
+                seed_kw = (title.split("\'96")[0] if "\'96" in title else title.split("-")[0]).strip() or sku\
+                rows.append(\{\
+                    "Campaign Type":"Manual",\
+                    "Campaign":f"\{brand\}_\{sku\}_Manual",\
+                    "Campaign Daily Budget": budget_manual,\
+                    "Campaign Start Date": today,\
+                    "Campaign End Date":"",\
+                    "Campaign Targeting Type":"Manual",\
+                    "Campaign Strategy":"Legacy",\
+                    "Ad Group":f"KW_\{sku\}_Exact",\
+                    "Max Bid": default_bid,\
+                    "Keyword/ASIN": seed_kw,\
+                    "Match Type":"exact",\
+                    "SKU":sku,\
+                    "State":"enabled",\
+                    "Placement":"",\
+                    "Custom Label 1":"seed",\
+                    "Source":"user",\
+                    "Notes":"seed from title"\
+                \})\
+\
+                # competitor keywords\
+                matched = cere_df.copy()\
+                # try to match by SourceASIN first if column exists\
+                if 'SourceASIN' in cere_df.columns and asin:\
+                    m = cere_df[cere_df['SourceASIN'].astype(str).str.strip() == asin]\
+                    if not m.empty:\
+                        matched = m\
+                # pick top K rows (order preserved from file)\
+                matched = matched[matched['Keyword'].astype(str).str.strip() != ""].head(int(top_k))\
+                for _, k in matched.iterrows():\
+                    kw = str(k.get("Keyword","")).strip()\
+                    mtype = str(k.get("MatchType") or "phrase").lower()\
+                    sb = k.get("SuggestedBid","")\
+                    try:\
+                        bid = float(sb)\
+                    except:\
+                        bid = (bid_phrase if mtype=="phrase" else bid_broad)\
+                    rows.append(\{\
+                        "Campaign Type":"Manual",\
+                        "Campaign":f"\{brand\}_\{sku\}_Manual",\
+                        "Campaign Daily Budget": budget_manual,\
+                        "Campaign Start Date": today,\
+                        "Campaign End Date":"",\
+                        "Campaign Targeting Type":"Manual",\
+                        "Campaign Strategy":"Legacy",\
+                        "Ad Group":f"KW_\{sku\}_\{mtype\}",\
+                        "Max Bid": bid,\
+                        "Keyword/ASIN": kw,\
+                        "Match Type": mtype,\
+                        "SKU":sku,\
+                        "State":"enabled",\
+                        "Placement":"",\
+                        "Custom Label 1":"cerebro",\
+                        "Source":"cerebro",\
+                        "Notes":"seeded from cerebro"\
+                    \})\
+\
+            # Product Targeting\
+            if enable_pt and 'SourceASIN' in cere_df.columns:\
+                comp_asins = cere_df['SourceASIN'].dropna().astype(str).unique().tolist()\
+                comp_asins = [x for x in comp_asins if x and x != asin][:5]\
+                for ca in comp_asins:\
+                    rows.append(\{\
+                        "Campaign Type":"ProductTargeting",\
+                        "Campaign":f"\{brand\}_\{sku\}_PT",\
+                        "Campaign Daily Budget": budget_pt,\
+                        "Campaign Start Date": today,\
+                        "Campaign End Date":"",\
+                        "Campaign Targeting Type":"Product",\
+                        "Campaign Strategy":"Legacy",\
+                        "Ad Group":f"PT_\{sku\}",\
+                        "Max Bid": bid_broad,\
+                        "Keyword/ASIN": ca,\
+                        "Match Type": "",\
+                        "SKU":sku,\
+                        "State":"enabled",\
+                        "Placement":"",\
+                        "Custom Label 1":"pt_cerebro",\
+                        "Source":"cerebro",\
+                        "Notes":"target competitor ASIN"\
+                    \})\
+\
+            # Negatives\
+            if enable_neg:\
+                neg_list = ["cheap lunch box","free lunch box","replacement lid"]\
+                for n in neg_list:\
+                    negs.append(\{\
+                        "Campaign Type":"Negative",\
+                        "Campaign":f"\{brand\}_\{sku\}_Negs",\
+                        "Campaign Daily Budget": budget_manual,\
+                        "Campaign Start Date": today,\
+                        "Campaign End Date":"",\
+                        "Campaign Targeting Type":"Manual",\
+                        "Campaign Strategy":"Legacy",\
+                        "Ad Group":f"Neg_\{sku\}",\
+                        "Max Bid": 0,\
+                        "Keyword/ASIN": n,\
+                        "Match Type":"broad",\
+                        "SKU":sku,\
+                        "State":"enabled",\
+                        "Placement":"",\
+                        "Custom Label 1":"auto_neg",\
+                        "Source":"user",\
+                        "Notes":"auto-neg list"\
+                    \})\
+\
+        # assemble dataframes\
+        if rows:\
+            df_bulk = pd.DataFrame(rows)\
+            df_bulk = make_unique_campaigns(df_bulk)\
+        else:\
+            df_bulk = pd.DataFrame(columns=['Campaign Type','Campaign','Campaign Daily Budget','Campaign Start Date','Campaign End Date','Campaign Targeting Type','Campaign Strategy','Ad Group','Max Bid','Keyword/ASIN','Match Type','SKU','State','Placement','Custom Label 1','Source','Notes'])\
+\
+        if negs:\
+            df_neg = pd.DataFrame(negs)\
+            df_neg = make_unique_campaigns(df_neg)\
+        else:\
+            df_neg = pd.DataFrame(columns=df_bulk.columns)\
+\
+        # preview & downloads\
+        preview.subheader("Bulk CSV \'97 first 12 rows")\
+        preview.dataframe(df_bulk.head(12), use_container_width=True)\
+        neg_preview.subheader("Negatives \'97 first 12 rows")\
+        neg_preview.dataframe(df_neg.head(12), use_container_width=True)\
+\
+        bulk_bytes = df_to_bytes(df_bulk)\
+        neg_bytes = df_to_bytes(df_neg)\
+\
+        dl.write("### Download")\
+        dl.download_button("Download Bulk CSV", data=bulk_bytes, file_name=f"ppc_bulk_\{today\}.csv", mime="text/csv")\
+        dl.download_button("Download Negatives CSV", data=neg_bytes, file_name=f"ppc_negative_\{today\}.csv", mime="text/csv")\
+\
+        # run log (in-memory quick)\
+        log.write(f"Last run: \{date.today().isoformat()\} \'97 Operator: \{operator\} \'97 Rows: bulk=\{len(df_bulk)\} neg=\{len(df_neg)\}")}

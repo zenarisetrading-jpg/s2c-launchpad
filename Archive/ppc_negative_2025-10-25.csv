@@ -1,0 +1,10 @@
+Campaign Type,Campaign,Campaign Daily Budget,Campaign Start Date,Campaign End Date,Campaign Targeting Type,Campaign Strategy,Ad Group,Max Bid,Keyword/ASIN,Match Type,SKU,State,Placement,Custom Label 1,Source,Notes
+Negative,S2C_THERMA-24-SS_Negs,50,2025-10-25,,Manual,Legacy,Neg_THERMA-24-SS,0,cheap water bottle,broad,THERMA-24-SS,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_THERMA-24-SS_Negs,50,2025-10-25,,Manual,Legacy,Neg_THERMA-24-SS,0,free water bottle,broad,THERMA-24-SS,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_THERMA-24-SS_Negs,50,2025-10-25,,Manual,Legacy,Neg_THERMA-24-SS,0,screw cap replacement,broad,THERMA-24-SS,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_ZENITH-30-TR_Negs,50,2025-10-25,,Manual,Legacy,Neg_ZENITH-30-TR,0,cheap water bottle,broad,ZENITH-30-TR,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_ZENITH-30-TR_Negs,50,2025-10-25,,Manual,Legacy,Neg_ZENITH-30-TR,0,free water bottle,broad,ZENITH-30-TR,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_ZENITH-30-TR_Negs,50,2025-10-25,,Manual,Legacy,Neg_ZENITH-30-TR,0,screw cap replacement,broad,ZENITH-30-TR,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_KIDS-18-PP_Negs,50,2025-10-25,,Manual,Legacy,Neg_KIDS-18-PP,0,cheap water bottle,broad,KIDS-18-PP,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_KIDS-18-PP_Negs,50,2025-10-25,,Manual,Legacy,Neg_KIDS-18-PP,0,free water bottle,broad,KIDS-18-PP,enabled,,auto_neg,user,auto-neg list
+Negative,S2C_KIDS-18-PP_Negs,50,2025-10-25,,Manual,Legacy,Neg_KIDS-18-PP,0,screw cap replacement,broad,KIDS-18-PP,enabled,,auto_neg,user,auto-neg list
