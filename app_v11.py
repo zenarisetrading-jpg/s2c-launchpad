@@ -295,7 +295,8 @@ if run_btn:
             "Product":"Sponsored Products","Entity":"Campaign","Operation":"Create",
             "Campaign ID":campaign_id,"Ad Group ID":"",
             "Campaign Name":campaign_name,"Ad Group Name":"",
-            "Start Date":ts,"End Date":end_ts,"Targeting Type":"",
+            "Start Date":ts,"End Date":end_ts,
+	    "Targeting Type": "Auto" if tactic == "Auto" else "Manual",
             "State":"enabled","Daily Budget":f"{allocation.get(tactic, 0.0):.2f}",
             "SKU":"","Bidding Strategy": bid_mode if 'bid_mode' in locals() else "",
             "Tactic":tactic
@@ -342,7 +343,7 @@ if run_btn:
                         "Start Date":ts,"End Date":end_ts,"Targeting Type":"Auto",
                         "State":"enabled","Daily Budget":"","SKU":"",
                         "Ad Group Default Bid":f"{base_bid:.2f}","Bid":f"{bid_val:.2f}",
-                        "Product Targeting Expression": f'TYPE="{pt}"',"Bidding Strategy":"",
+                        "Product Targeting Expression": pt,"Bidding Strategy":"",
                         "Tactic":f"Auto-{pt}"
                     }
                     append_row_dict(entities, row)
